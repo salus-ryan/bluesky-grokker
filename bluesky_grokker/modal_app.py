@@ -800,17 +800,65 @@ def swarm_distill(
     print("\n  ⡷ PHASE 2: Z₂⁸ tiered encoding + relation tuples …")
     t_phase2 = time.monotonic()
 
+    # Import canonicalization + semantic filtering from memory module
+    from braille_memory import canonicalize_concept, is_nonsemantic, find_nearest_memory_concept
+
+    # Canonicalize ALL concepts before codec + consensus
+    # This increases recurrence → better weight concentration → fewer bits/concept
+    n_canon = 0
+    n_nonsem_filtered = 0
+    for ext in model_extractions:
+        d = ext["data"]
+        for key in ("topics", "entities", "sentiments", "actions"):
+            raw_list = d.get(key, [])
+            canon_list = []
+            for c in raw_list:
+                if not c:
+                    continue
+                canonical = canonicalize_concept(c)
+                # Map to existing memory concept if close
+                mem_match = find_nearest_memory_concept(canonical, memory.concepts)
+                if mem_match is not None:
+                    if mem_match != canonical:
+                        n_canon += 1
+                    canonical = mem_match
+                elif canonical != c.lower().strip():
+                    n_canon += 1
+                canon_list.append(canonical)
+            d[key] = canon_list
+        # Canonicalize relation endpoints too
+        for rel in d.get("relations", []):
+            for f in ("src", "tgt"):
+                val = rel.get(f, "")
+                if val:
+                    canonical = canonicalize_concept(val)
+                    mem_match = find_nearest_memory_concept(canonical, memory.concepts)
+                    if mem_match:
+                        canonical = mem_match
+                    rel[f] = canonical
+
+    if n_canon > 0:
+        print(f"  ⡷ Canonicalized {n_canon} concepts to memory-space IDs")
+
     # Collect ALL concepts across all models for the shared codec
+    # Filter out non-semantic tokens so they don't steal short tier codes
     all_concepts: list[str] = []
     for ext in model_extractions:
         d = ext["data"]
         for key in ("topics", "entities", "sentiments", "actions"):
-            all_concepts.extend(d.get(key, []))
+            for c in d.get(key, []):
+                if not is_nonsemantic(c):
+                    all_concepts.append(c)
+                else:
+                    n_nonsem_filtered += 1
         for rel in d.get("relations", []):
             for f in ("src", "tgt", "type"):
                 val = rel.get(f, "")
-                if val:
+                if val and not is_nonsemantic(val):
                     all_concepts.append(val)
+
+    if n_nonsem_filtered > 0:
+        print(f"  ⡷ Filtered {n_nonsem_filtered} non-semantic tokens from codec tiers")
 
     # Build the tiered variable-width codec (1/2/3/4/8-bit tiers)
     codec = TieredConceptCodec(all_concepts)
@@ -825,8 +873,11 @@ def swarm_distill(
         concept_bitstream = ""
 
         # Encode concept categories as variable-width bitstream
+        # Skip non-semantic tokens — they don't get encoded into braille
         for key in ("topics", "entities", "sentiments", "actions"):
             for concept in d.get(key, []):
+                if is_nonsemantic(concept):
+                    continue
                 concept_bitstream += codec.encode_concept_with_literal(concept)
                 concept_tokens.append(concept)
 
@@ -986,6 +1037,15 @@ def swarm_distill(
           f"avg_bits={epoch.avg_bits}, "
           f"pruned {epoch.stats.get('pruned_concepts', 0)} concepts")
 
+    # Detect motifs — repeated structural patterns in the graph
+    motifs = memory.detect_motifs(min_count=2, top_k=10)
+    if motifs:
+        star_motifs = [m for m in motifs if m["type"].startswith("star")]
+        rtype_motifs = [m for m in motifs if m["type"] == "relation_type"]
+        print(f"  🧬 Motifs: {len(star_motifs)} star patterns, {len(rtype_motifs)} relation types")
+        for m in star_motifs[:3]:
+            print(f"    ↪ {m['pattern']} (×{m['count']}, w={m['total_weight']:.1f})")
+
     # Memory-augmented concepts: blend new-in-this-epoch with persistent memory
     memory_top = memory.top_concepts(10)
     memory_context = "\n".join(
@@ -995,6 +1055,15 @@ def swarm_distill(
     memory_rel_ctx = "\n".join(
         f"  {k} (w={w:.2f})" for k, w in memory_rels
     )
+    # Motif context for the decoder
+    motif_ctx = ""
+    if motifs:
+        motif_lines = []
+        for m in motifs[:5]:
+            if m["type"].startswith("star"):
+                motif_lines.append(f"  {m['pattern']} (×{m['count']})")
+        if motif_lines:
+            motif_ctx = "\n".join(motif_lines)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PHASE 4: Decode consensus → English observation for Bluesky
@@ -1045,7 +1114,8 @@ def swarm_distill(
         f"BrailleMemory context (persistent weights, epoch #{len(memory.epochs)}, "
         f"drift={epoch.drift_score:.2f}):\n{memory_context}\n\n"
         f"Memory relation graph:\n{memory_rel_ctx}\n\n"
-        "Decode this into a single Bluesky post (max 180 chars):"
+        + (f"Structural motifs (repeated patterns):\n{motif_ctx}\n\n" if motif_ctx else "")
+        + "Decode this into a single Bluesky post (max 180 chars):"
     )
 
     # Try decoder models in order until one responds

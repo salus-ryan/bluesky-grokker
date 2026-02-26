@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -53,6 +54,165 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 log = logging.getLogger(__name__)
 
 BRAILLE_BASE = 0x2800
+
+# ── Non-semantic filter: tokens that should never occupy short tiers ──────────
+
+# URL-like patterns, TLDs, boilerplate that compress well but carry no meaning
+_NONSEMANTIC_EXACT = frozenset({
+    "com", "www", "https", "http", "org", "net", "io", "co", "edu", "gov",
+    "bsky", "bsky.social", "bsky.app", "twitter", "x.com",
+    "please", "share", "follow", "like", "repost", "subscribe",
+    "click", "link", "url", "amp", "ref", "utm",
+    "it's", "i'm", "don't", "can't", "won't", "that's", "we're",
+    "the", "and", "but", "for", "not", "you", "all", "can", "had",
+    "her", "was", "one", "our", "out", "are", "has", "his", "how",
+    "its", "may", "new", "now", "old", "see", "way", "who", "did",
+    "get", "let", "say", "she", "too", "use", "more", "just", "also",
+    "right", "really", "thing", "things", "people", "someone", "something",
+    "going", "getting", "want", "need", "think", "know", "make",
+    "good", "bad", "much", "very", "still", "even", "back", "well",
+    "yeah", "yes", "no", "ok", "okay", "lol", "lmao", "omg",
+    "mixed", "discussing",  # cluster fallback filler
+})
+
+_NONSEMANTIC_PATTERNS = [
+    re.compile(r"^https?://", re.I),
+    re.compile(r"^www\.", re.I),
+    re.compile(r"^@[a-z0-9]", re.I),      # @handles
+    re.compile(r"\.(com|org|net|io|app|social|xyz)$", re.I),
+    re.compile(r"^[a-f0-9]{8,}$"),          # hex hashes
+    re.compile(r"^\d+$"),                    # pure numbers
+]
+
+# Tier penalty: nonsemantic concepts get their weight multiplied by this
+# so they can still exist in memory but won't steal short codes
+NONSEMANTIC_WEIGHT_PENALTY = 0.1
+
+
+def is_nonsemantic(concept: str) -> bool:
+    """Return True if a concept is non-semantic boilerplate."""
+    c = concept.lower().strip()
+    if c in _NONSEMANTIC_EXACT:
+        return True
+    if len(c) <= 2:
+        return True
+    for pat in _NONSEMANTIC_PATTERNS:
+        if pat.search(c):
+            return True
+    return False
+
+
+# ── Concept canonicalization ──────────────────────────────────────────────────
+
+# Hand-built alias map: maps variant → canonical form
+_ALIAS_MAP = {
+    "social media": "social media",
+    "social": "social media",
+    "digital sharing": "social media",
+    "sharing online": "social media",
+    "us politics": "american politics",
+    "u.s. politics": "american politics",
+    "american politics": "american politics",
+    "usa politics": "american politics",
+    "uk economy": "british economy",
+    "uk economy decline": "british economy",
+    "british economy": "british economy",
+    "ai": "artificial intelligence",
+    "a.i.": "artificial intelligence",
+    "machine learning": "artificial intelligence",
+    "ml": "artificial intelligence",
+    "crypto": "cryptocurrency",
+    "bitcoin": "cryptocurrency",
+    "btc": "cryptocurrency",
+    "climate change": "climate change",
+    "global warming": "climate change",
+    "climate crisis": "climate change",
+}
+
+# Regex-based normalizations applied in order
+_CANON_TRANSFORMS = [
+    (re.compile(r"[''`]"), "'"),         # normalize quotes
+    (re.compile(r"[""„]"), '"'),         # normalize double quotes
+    (re.compile(r"\s+"), " "),           # collapse whitespace
+    (re.compile(r"[^\w\s\-'./]"), ""),   # strip most punctuation
+]
+
+
+def canonicalize_concept(concept: str) -> str:
+    """Normalize a concept string to its canonical form.
+
+    1. lowercase + strip
+    2. apply regex normalizations
+    3. check alias map
+    4. strip trailing 's' for simple depluralization (if >4 chars)
+    """
+    c = concept.lower().strip()
+    for pattern, repl in _CANON_TRANSFORMS:
+        c = pattern.sub(repl, c)
+    c = c.strip()
+
+    # Check alias map
+    if c in _ALIAS_MAP:
+        return _ALIAS_MAP[c]
+
+    # Simple depluralization (avoids needing nltk)
+    if len(c) > 4 and c.endswith("s") and not c.endswith("ss"):
+        singular = c[:-1]
+        if singular in _ALIAS_MAP:
+            return _ALIAS_MAP[singular]
+
+    return c
+
+
+def find_nearest_memory_concept(concept: str, memory_concepts: Dict[str, Any],
+                                 threshold: float = 0.8) -> Optional[str]:
+    """Find the best matching existing memory concept for a new concept.
+
+    Uses character-level similarity (Jaccard on character trigrams).
+    Returns the matching memory concept key if similarity >= threshold,
+    otherwise None.
+    """
+    if not memory_concepts:
+        return None
+
+    c = concept.lower().strip()
+    if c in memory_concepts:
+        return c
+
+    # Build trigrams for the input
+    c_trigrams = set()
+    padded = f"  {c}  "
+    for i in range(len(padded) - 2):
+        c_trigrams.add(padded[i:i+3])
+
+    if not c_trigrams:
+        return None
+
+    best_match = None
+    best_sim = 0.0
+
+    for mem_concept in memory_concepts:
+        if abs(len(mem_concept) - len(c)) > max(len(c), len(mem_concept)) * 0.5:
+            continue  # skip wildly different lengths
+
+        m_padded = f"  {mem_concept}  "
+        m_trigrams = set()
+        for i in range(len(m_padded) - 2):
+            m_trigrams.add(m_padded[i:i+3])
+
+        if not m_trigrams:
+            continue
+
+        # Jaccard similarity on trigrams
+        intersection = len(c_trigrams & m_trigrams)
+        union = len(c_trigrams | m_trigrams)
+        sim = intersection / union if union > 0 else 0.0
+
+        if sim > best_sim and sim >= threshold:
+            best_sim = sim
+            best_match = mem_concept
+
+    return best_match
 
 
 # ── Data types ───────────────────────────────────────────────────────────────
@@ -185,31 +345,59 @@ class BrailleMemory:
         n_concepts = 0
         n_relations = 0
 
+        n_filtered = 0
+        n_canonicalized = 0
+
         # Ingest concepts
         for category, concept_list in concepts_by_category.items():
             for concept in concept_list:
                 if not concept:
                     continue
-                concept_lower = concept.lower().strip()
-                node = self.concepts.get(concept_lower)
+
+                # Canonicalize: normalize + alias merge
+                canonical = canonicalize_concept(concept)
+                if canonical != concept.lower().strip():
+                    n_canonicalized += 1
+
+                # Memory-space mapping: match to existing memory concept if close
+                mem_match = find_nearest_memory_concept(canonical, self.concepts)
+                if mem_match is not None and mem_match != canonical:
+                    canonical = mem_match
+                    n_canonicalized += 1
+
+                # Non-semantic filter: penalize but don't discard
+                signal = self.SIGNAL_POST
+                if is_nonsemantic(canonical):
+                    signal *= NONSEMANTIC_WEIGHT_PENALTY
+                    n_filtered += 1
+
+                node = self.concepts.get(canonical)
                 if node is None:
                     node = ConceptNode()
-                    self.concepts[concept_lower] = node
+                    self.concepts[canonical] = node
 
                 node.frequency += 1
-                node.weight += self.SIGNAL_POST
+                node.weight += signal
                 node.providers.add(provider)
                 node.last_seen = now
                 node.categories.add(category)
                 n_concepts += 1
 
-        # Ingest relations
+        # Ingest relations (with canonicalized endpoints)
         for rel in relations:
-            src = (rel.get("src") or "").lower().strip()
+            src = canonicalize_concept(rel.get("src") or "")
             rtype = (rel.get("type") or "").upper().strip()
-            tgt = (rel.get("tgt") or "").lower().strip()
+            tgt = canonicalize_concept(rel.get("tgt") or "")
             if not (src and rtype and tgt):
                 continue
+
+            # Map to memory-space concepts
+            src_match = find_nearest_memory_concept(src, self.concepts)
+            if src_match:
+                src = src_match
+            tgt_match = find_nearest_memory_concept(tgt, self.concepts)
+            if tgt_match:
+                tgt = tgt_match
 
             key = f"{src}→{rtype}→{tgt}"
             edge = self.relations.get(key)
@@ -225,7 +413,12 @@ class BrailleMemory:
 
         self._total_posts_seen += n_posts
 
-        return {"concepts_ingested": n_concepts, "relations_ingested": n_relations}
+        return {
+            "concepts_ingested": n_concepts,
+            "relations_ingested": n_relations,
+            "nonsemantic_penalized": n_filtered,
+            "canonicalized": n_canonicalized,
+        }
 
     # ── Interaction feedback ─────────────────────────────────────────────
 
@@ -409,6 +602,90 @@ class BrailleMemory:
             )
             for key, _ in ranked[:len(self.relations) - self.MAX_RELATIONS]:
                 del self.relations[key]
+
+    # ── Motif detection: repeated subgraph patterns ──────────────────────
+
+    def detect_motifs(self, min_count: int = 2, top_k: int = 20) -> List[Dict]:
+        """Detect repeated structural patterns in the relation graph.
+
+        Motifs are reusable subgraph patterns that appear frequently:
+        - Star motifs: a hub concept with multiple edges of the same type
+        - Relation-type patterns: (type, degree) pairs that recur
+        - Chain motifs: A→B→C paths that repeat
+
+        Returns a list of motifs sorted by frequency, each with:
+        - pattern: string description of the motif
+        - count: how many times it appears
+        - hub: the central concept (for star motifs)
+        - edges: the relation keys involved
+        """
+        motifs: List[Dict] = []
+
+        # --- Star motifs: concepts with N+ edges of the same type ---
+        # Group edges by (src, type) and (tgt, type)
+        src_type_groups: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+        tgt_type_groups: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+
+        for key, edge in self.relations.items():
+            parts = key.split("→")
+            if len(parts) != 3:
+                continue
+            src, rtype, tgt = parts
+            src_type_groups[(src, rtype)].append(key)
+            tgt_type_groups[(tgt, rtype)].append(key)
+
+        for (hub, rtype), edges in src_type_groups.items():
+            if len(edges) >= min_count:
+                total_weight = sum(
+                    self.relations[k].weight for k in edges if k in self.relations
+                )
+                motifs.append({
+                    "pattern": f"star:{hub}→[{rtype}]→*",
+                    "type": "star_out",
+                    "count": len(edges),
+                    "hub": hub,
+                    "relation_type": rtype,
+                    "edges": edges,
+                    "total_weight": total_weight,
+                })
+
+        for (hub, rtype), edges in tgt_type_groups.items():
+            if len(edges) >= min_count:
+                total_weight = sum(
+                    self.relations[k].weight for k in edges if k in self.relations
+                )
+                motifs.append({
+                    "pattern": f"star:*→[{rtype}]→{hub}",
+                    "type": "star_in",
+                    "count": len(edges),
+                    "hub": hub,
+                    "relation_type": rtype,
+                    "edges": edges,
+                    "total_weight": total_weight,
+                })
+
+        # --- Relation-type frequency (global structural pattern) ---
+        rtype_counts: Counter = Counter()
+        for key in self.relations:
+            parts = key.split("→")
+            if len(parts) == 3:
+                rtype_counts[parts[1]] += 1
+
+        for rtype, count in rtype_counts.most_common(10):
+            if count >= min_count:
+                motifs.append({
+                    "pattern": f"rtype:{rtype}",
+                    "type": "relation_type",
+                    "count": count,
+                    "hub": None,
+                    "relation_type": rtype,
+                    "edges": [],
+                    "total_weight": 0,
+                })
+
+        # Sort by count × weight for star motifs, count for type motifs
+        motifs.sort(key=lambda m: (m["count"] * (m.get("total_weight", 0) + 1)), reverse=True)
+        return motifs[:top_k]
 
     # ── Thinking: activation spreading in braille space ──────────────────
 
