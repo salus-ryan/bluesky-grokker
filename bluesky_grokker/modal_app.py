@@ -1,14 +1,19 @@
 """Modal-deployed Bluesky Firehose → Braille-Swarm-Consensus → Post pipeline.
 
 Usage:
-    # One-shot run (default 30s firehose window):
-    modal run modal_app.py
+    # One-shot run (default 20s firehose window):
+    modal run bluesky_grokker/modal_app.py
+    modal run bluesky_grokker/modal_app.py --seconds 30 --dry-run
 
-    # Custom window:
-    modal run modal_app.py --seconds 60
+    # Continuous loop (stays alive, sleeps between runs):
+    modal run bluesky_grokker/modal_app.py --loop
+    modal run bluesky_grokker/modal_app.py --loop --interval 600 --max-loops 24
 
-    # Deploy as a cron (every 15 minutes):
-    modal deploy modal_app.py
+    # 24/7 cron deployment (~$8-12/month):
+    modal deploy bluesky_grokker/modal_app.py
+    #   → Runs every 15 min, 10s firehose, skips 2-8am UTC
+    #   → No idle costs (cold start each invocation)
+    #   → Stop with: modal app stop bluesky-grokker-swarm
 
 Requires:
     pip install modal
@@ -1671,6 +1676,15 @@ def main(
 
 
 # ── Scheduled cron (every 15 min) ────────────────────────────────────────────
+#
+# Cost-optimized 24/7 deployment:
+#   modal deploy bluesky_grokker/modal_app.py
+#
+# Each invocation: ~2 min CPU, ~$0.004
+# 96 runs/day × $0.004 = ~$0.38/day = ~$11.50/month
+# With night skip (2-8 UTC): ~72 runs/day = ~$8.60/month
+#
+# To stop: modal app stop bluesky-grokker-swarm
 
 
 @app.function(
@@ -1679,5 +1693,26 @@ def main(
     volumes={"/data": memory_volume},
 )
 def scheduled_run():
-    """Auto-run every 15 minutes when deployed with `modal deploy`."""
-    return run_pipeline.remote(seconds=20, dry_run=False)
+    """Auto-run every 15 minutes when deployed with `modal deploy`.
+
+    Cost-optimized:
+      - 10s firehose window (still captures 100+ posts)
+      - Skips 02:00-08:00 UTC (low-activity hours, saves ~25%)
+      - No idle container between runs (cron = cold start each time)
+      - All models are free-tier OpenRouter
+
+    Estimated cost: ~$8-12/month for 24/7 operation.
+    """
+    import time
+
+    # Night skip: 02:00-08:00 UTC — discourse is slow, save compute
+    hour_utc = int(time.strftime("%H", time.gmtime()))
+    if 2 <= hour_utc < 8:
+        print(f"  💤 Night skip: {hour_utc}:00 UTC (sleeping 02-08 UTC)")
+        return {"skipped": True, "reason": "night_hours", "hour_utc": hour_utc}
+
+    try:
+        return run_pipeline.remote(seconds=10, dry_run=False)
+    except Exception as e:
+        print(f"  ❌ Scheduled run failed: {e}")
+        return {"error": str(e)[:300]}
