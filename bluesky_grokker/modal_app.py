@@ -38,18 +38,33 @@ image = (
     )
 )
 
+# Persistent volume for BrailleMemory state (survives across runs)
+memory_volume = modal.Volume.from_name("braille-memory", create_if_missing=True)
+MEMORY_PATH = "/data/braille_memory.json"
+
+# Mount the swarm package into Modal containers so we can import BrailleMemory
+swarm_mount = modal.Mount.from_local_dir(
+    "bluesky_grokker/swarm",
+    remote_path="/root/swarm",
+)
+
 app = modal.App(
     name="bluesky-grokker-swarm",
     image=image,
     secrets=[modal.Secret.from_name("bluesky-grokker")],
 )
 
+
 # ── Firehose capture ─────────────────────────────────────────────────────────
 
 
 @app.function(timeout=300)
-def capture_firehose(seconds: int = 30) -> list[dict]:
-    """Connect to the Bluesky firehose and collect posts for `seconds`."""
+def capture_firehose(seconds: int = 30) -> dict:
+    """Connect to the Bluesky firehose and collect posts + interactions.
+
+    Returns {"posts": [...], "interactions": [...]} where interactions are
+    likes, reposts, and replies — the signals that feed BrailleMemory.
+    """
     import threading
     import time
     from datetime import datetime, timezone
@@ -62,6 +77,7 @@ def capture_firehose(seconds: int = 30) -> list[dict]:
     )
 
     posts: list[dict] = []
+    interactions: list[dict] = []
     lock = threading.Lock()
     client = FirehoseSubscribeReposClient()
     deadline = time.monotonic() + seconds
@@ -89,12 +105,13 @@ def capture_firehose(seconds: int = 30) -> list[dict]:
             if raw is None:
                 continue
 
-            if raw.get("$type") == "app.bsky.feed.post":
+            record_type = raw.get("$type", "")
+
+            if record_type == "app.bsky.feed.post":
                 text = raw.get("text", "").strip()
                 if not text or len(text) < 10:
                     continue
                 langs = raw.get("langs") or []
-                # Only English posts (or untagged)
                 if langs and "en" not in langs:
                     continue
 
@@ -106,26 +123,55 @@ def capture_firehose(seconds: int = 30) -> list[dict]:
                 except Exception:
                     created_at = datetime.now(timezone.utc).isoformat()
 
+                is_reply = bool(raw.get("reply"))
+
                 with lock:
-                    posts.append(
-                        {
-                            "uri": f"at://{commit.repo}/{op.path}",
+                    posts.append({
+                        "uri": f"at://{commit.repo}/{op.path}",
+                        "author_did": commit.repo,
+                        "text": text[:500],
+                        "created_at": created_at,
+                        "is_reply": is_reply,
+                    })
+                    if is_reply:
+                        interactions.append({
+                            "type": "reply",
                             "author_did": commit.repo,
-                            "text": text[:500],
-                            "created_at": created_at,
-                        }
-                    )
+                            "target_uri": (raw.get("reply", {})
+                                           .get("parent", {})
+                                           .get("uri", "")),
+                            "text": text[:200],
+                        })
+
+            elif record_type == "app.bsky.feed.like":
+                subject = raw.get("subject", {})
+                with lock:
+                    interactions.append({
+                        "type": "like",
+                        "author_did": commit.repo,
+                        "target_uri": subject.get("uri", "") if isinstance(subject, dict) else "",
+                    })
+
+            elif record_type == "app.bsky.feed.repost":
+                subject = raw.get("subject", {})
+                with lock:
+                    interactions.append({
+                        "type": "repost",
+                        "author_did": commit.repo,
+                        "target_uri": subject.get("uri", "") if isinstance(subject, dict) else "",
+                    })
 
     print(f"🔥 Capturing firehose for {seconds}s …")
-    # Run the blocking firehose client in the main thread
-    # It will self-stop when the deadline is reached
     try:
         client.start(on_message)
     except Exception:
         pass  # client.stop() causes a benign exception
 
-    print(f"📦 Captured {len(posts)} posts")
-    return posts
+    print(f"📦 Captured {len(posts)} posts, {len(interactions)} interactions "
+          f"({sum(1 for i in interactions if i['type']=='like')} likes, "
+          f"{sum(1 for i in interactions if i['type']=='repost')} reposts, "
+          f"{sum(1 for i in interactions if i['type']=='reply')} replies)")
+    return {"posts": posts, "interactions": interactions}
 
 
 # ── Semantic clustering (lightweight, no DB needed) ──────────────────────────
@@ -526,24 +572,49 @@ SWARM_MODELS = [
 ]
 
 
-@app.function(timeout=300)
-def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
-    """Braille-swarm-consensus pipeline.
+@app.function(timeout=300, mounts=[swarm_mount])
+def swarm_distill(
+    clusters: list[dict],
+    window_seconds: int = 30,
+    memory_state: str = "",
+) -> dict:
+    """Braille-swarm-consensus pipeline with persistent BrailleMemory.
 
     Phase 1 — Fan out to N models: each extracts structured concept tokens
     Phase 2 — Encode all concepts into Z₂⁸ braille vector space
+    Phase 2b— Feed extractions into BrailleMemory (the living weight model)
     Phase 3 — Merge/distill in braille-encoded space (multi-provider boosting)
+    Phase 3b— BrailleMemory thinks: activation spreading from consensus seeds
     Phase 4 — Decode consensus concept graph → English observation
 
-    Returns {"text": ..., "models": [...], "braille": ..., "motl_stats": ...}.
+    Returns {"text": ..., "models": [...], "braille": ..., "motl_stats": ...,
+             "memory_state": ..., "memory_summary": ...}.
     """
     import json
     import os
+    import sys
     import time
     from collections import Counter
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     import openai
+
+    # Import BrailleMemory from the mounted swarm package
+    sys.path.insert(0, "/root")
+    from swarm.memory import BrailleMemory
+
+    # Load or create memory
+    if memory_state:
+        try:
+            memory = BrailleMemory.load(memory_state)
+            print(f"  🧠 Memory loaded: {len(memory.concepts)} concepts, "
+                  f"{len(memory.relations)} relations, {len(memory.epochs)} epochs")
+        except Exception as e:
+            print(f"  ⚠️ Memory load failed: {e}, starting fresh")
+            memory = BrailleMemory()
+    else:
+        memory = BrailleMemory()
+        print("  🧠 Fresh BrailleMemory initialized")
 
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
@@ -715,6 +786,26 @@ def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
     print(f"  ⏱  Phase 2: {phase2_ms:.0f}ms")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PHASE 2b: Feed extractions into BrailleMemory (the living weight model)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    print("\n  🧠 PHASE 2b: Feeding extractions into BrailleMemory …")
+    for ext in model_extractions:
+        d = ext["data"]
+        provider = ext["model"].split("/")[-1]
+        concepts_by_cat = {}
+        for key in ("topics", "entities", "sentiments", "actions"):
+            concepts_by_cat[key] = d.get(key, [])
+        memory.ingest_extraction(
+            concepts_by_category=concepts_by_cat,
+            relations=d.get("relations", []),
+            provider=provider,
+            n_posts=total_posts,
+        )
+    print(f"  🧠 Memory now: {len(memory.concepts)} concepts, "
+          f"{len(memory.relations)} relations")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PHASE 3: Braille-space consensus — decode, merge, boost multi-provider
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -793,6 +884,38 @@ def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
     print(f"  ⏱  Phase 3: {phase3_ms:.0f}ms")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PHASE 3b: BrailleMemory thinks — activation spreading + epoch close
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    print("\n  🧠 PHASE 3b: BrailleMemory thinking …")
+
+    # Spread activation from the top consensus concepts
+    seed_concepts = [c[0] for c in concept_scores[:10]]
+    thought = memory.think(seed_concepts, depth=2, top_k=15)
+
+    # Close the epoch (apply decay, compute drift, prune)
+    epoch = memory.close_epoch(n_posts=total_posts)
+
+    print(f"  🧠 Thought: {len(thought['activated_concepts'])} activated concepts")
+    print(f"  🧠 Thought braille: {thought['braille'][:30]}…")
+    if thought["paths"]:
+        for p in thought["paths"][:5]:
+            print(f"    ↪ {p}")
+    print(f"  🧠 Epoch #{len(memory.epochs)}: drift={epoch.drift_score:.2f}, "
+          f"avg_bits={epoch.avg_bits}, "
+          f"pruned {epoch.stats.get('pruned_concepts', 0)} concepts")
+
+    # Memory-augmented concepts: blend new-in-this-epoch with persistent memory
+    memory_top = memory.top_concepts(10)
+    memory_context = "\n".join(
+        f"  {c} (memory_weight={w:.2f})" for c, w in memory_top
+    )
+    memory_rels = memory.top_relations(5)
+    memory_rel_ctx = "\n".join(
+        f"  {k} (w={w:.2f})" for k, w in memory_rels
+    )
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PHASE 4: Decode consensus → English observation for Bluesky
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -818,8 +941,11 @@ def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
         "1. Ranked concept tokens with confidence scores from a multi-model swarm\n"
         "2. A semantic knowledge graph encoded as (subject)→[relation]→(object) triples\n"
         "3. Individual model insights\n"
-        "4. The raw braille-encoded consensus (variable-width tiered + relation tuples)\n\n"
+        "4. The raw braille-encoded consensus (variable-width tiered + relation tuples)\n"
+        "5. Memory context: persistent concept weights and trending relations from a "
+        "continuously-learning braille-native model\n\n"
         "Synthesize these into ONE sharp, specific Bluesky post (max 180 chars). "
+        "Use memory context to add depth — reference persistent trends, not just this snapshot. "
         "Reference actual topics. Be insightful, not generic. No hashtags. "
         "Output ONLY the post text, no quotes."
     )
@@ -831,6 +957,9 @@ def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
         f"Top ranked concepts (by multi-model agreement):\n{concept_summary}\n\n"
         f"Knowledge graph edges ({n_edge_tuples} triples):\n{relation_summary}\n\n"
         f"Model insights:\n{insight_summary}\n\n"
+        f"BrailleMemory context (persistent weights, epoch #{len(memory.epochs)}, "
+        f"drift={epoch.drift_score:.2f}):\n{memory_context}\n\n"
+        f"Memory relation graph:\n{memory_rel_ctx}\n\n"
         "Decode this into a single Bluesky post (max 180 chars):"
     )
 
@@ -856,11 +985,18 @@ def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
     # ── Build result ──
     model_names = [e["model"].split("/")[-1] for e in encoded_per_model]
 
+    # Serialize memory for persistence
+    updated_memory_state = memory.save()
+    mem_summary = memory.summary()
+
     return {
         "text": observation[:280],
         "models": model_names,
         "braille_consensus": full_consensus_braille,
+        "thought_braille": thought.get("braille", ""),
         "consensus_concepts": consensus_concepts,
+        "memory_state": updated_memory_state,
+        "memory_summary": mem_summary,
         "motl_stats": {
             "total_concepts": len(concept_scores),
             "multi_model_concepts": n_multi,
@@ -871,6 +1007,11 @@ def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
             "variable_width_savings_pct": codec_stats["variable_width_savings"],
             "tier_distribution": codec_stats["tier_distribution"],
             "encoding_table_size": codec_stats["total_encoded"],
+            "memory_concepts": len(memory.concepts),
+            "memory_relations": len(memory.relations),
+            "memory_epochs": len(memory.epochs),
+            "memory_drift": epoch.drift_score,
+            "memory_avg_bits": epoch.avg_bits,
             "phase1_ms": round(phase1_ms),
             "phase2_ms": round(phase2_ms),
             "phase3_ms": round(phase3_ms),
@@ -910,22 +1051,61 @@ def post_to_bluesky(text: str) -> dict:
 # ── Full pipeline ─────────────────────────────────────────────────────────────
 
 
-@app.function(timeout=600)
+@app.function(
+    timeout=600,
+    volumes={"/data": memory_volume},
+    mounts=[swarm_mount],
+)
 def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
-    """End-to-end: firehose capture → cluster → swarm distill → post."""
+    """End-to-end: firehose → cluster → swarm distill (with memory) → post.
+
+    BrailleMemory persists across runs on a Modal Volume.  Every pipeline
+    execution loads the previous memory, feeds it new data, and saves the
+    updated weights.  The model never stops learning.
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, "/root")
+    from swarm.memory import BrailleMemory
+
     print(f"\n{'='*60}")
-    print(f"  BLUESKY-GROKKER SWARM PIPELINE")
+    print(f"  BLUESKY-GROKKER SWARM PIPELINE (braille-∞)")
     print(f"  Firehose window: {seconds}s")
     print(f"  Dry run: {dry_run}")
     print(f"{'='*60}\n")
 
-    # Stage 1: Capture
-    posts = capture_firehose.remote(seconds=seconds)
+    # ── Load persistent BrailleMemory ──
+    memory_state = ""
+    try:
+        if os.path.exists(MEMORY_PATH):
+            with open(MEMORY_PATH, "r") as f:
+                memory_state = f.read()
+            if memory_state.strip():
+                mem_preview = BrailleMemory.load(memory_state)
+                print(f"🧠 Loaded BrailleMemory: {len(mem_preview.concepts)} concepts, "
+                      f"{len(mem_preview.relations)} relations, "
+                      f"{len(mem_preview.epochs)} epochs\n")
+                del mem_preview  # free; the real one lives in swarm_distill
+            else:
+                memory_state = ""
+    except Exception as e:
+        print(f"⚠️ Memory load failed: {e}, starting fresh\n")
+        memory_state = ""
+
+    if not memory_state:
+        print("🧠 Starting fresh BrailleMemory\n")
+
+    # Stage 1: Capture (posts + interactions)
+    firehose_data = capture_firehose.remote(seconds=seconds)
+    posts = firehose_data.get("posts", [])
+    interactions = firehose_data.get("interactions", [])
+
     if not posts:
         print("❌ No posts captured")
         return {"error": "No posts captured"}
 
-    print(f"\n📊 Stage 1 complete: {len(posts)} posts captured\n")
+    print(f"\n📊 Stage 1 complete: {len(posts)} posts, {len(interactions)} interactions\n")
 
     # Stage 2: Cluster
     clusters = cluster_posts.remote(posts)
@@ -938,12 +1118,17 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
         print(f"    • {c['topic']} ({c['post_count']} posts)")
     print()
 
-    # Stage 3: Swarm distill (MOTL / Z₂⁸ braille pipeline)
-    distill_result = swarm_distill.remote(clusters, window_seconds=seconds)
+    # Stage 3: Swarm distill (MOTL / Z₂⁸ + BrailleMemory)
+    distill_result = swarm_distill.remote(
+        clusters,
+        window_seconds=seconds,
+        memory_state=memory_state,
+    )
     observation = distill_result["text"]
     models_used = distill_result["models"]
     braille_snip = distill_result.get("braille_consensus", "")[:20]
     motl = distill_result.get("motl_stats", {})
+    mem_summary = distill_result.get("memory_summary", {})
 
     print(f"\n📊 Stage 3 complete: MOTL consensus ready")
     print(f"    \"{observation}\"")
@@ -951,7 +1136,51 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
     print(f"    Braille: {braille_snip}…")
     print(f"    MOTL: {motl.get('total_concepts',0)} concepts, "
           f"{motl.get('multi_model_concepts',0)} multi-model, "
-          f"{motl.get('compression_ratio',0)}× compression\n")
+          f"{motl.get('compression_ratio',0)}× compression")
+    print(f"    Memory: {motl.get('memory_concepts',0)} concepts, "
+          f"{motl.get('memory_epochs',0)} epochs, "
+          f"drift={motl.get('memory_drift',0):.2f}\n")
+
+    # ── Feed interactions into memory for next epoch ──
+    # The memory state returned from distill already has this epoch's concepts.
+    # Now layer on interaction signals (likes/reposts boost related concepts).
+    updated_memory_state = distill_result.get("memory_state", "")
+    if updated_memory_state and interactions:
+        try:
+            mem = BrailleMemory.load(updated_memory_state)
+            # We don't know which concepts a liked/reposted post contains,
+            # but we can boost concepts that were active this epoch (the top ones).
+            active_concepts = distill_result.get("consensus_concepts", [])[:20]
+            n_likes = sum(1 for i in interactions if i["type"] == "like")
+            n_reposts = sum(1 for i in interactions if i["type"] == "repost")
+            n_replies = sum(1 for i in interactions if i["type"] == "reply")
+
+            # Distribute interaction signals across active concepts
+            # Each like/repost/reply slightly boosts the epoch's active concepts
+            if active_concepts:
+                for itype, count in [("like", n_likes), ("repost", n_reposts), ("reply", n_replies)]:
+                    if count > 0:
+                        # Scale down: many interactions, small per-concept boost
+                        scale = min(count, 100) / max(len(active_concepts), 1)
+                        for _ in range(min(int(scale), 10)):
+                            mem.record_interaction(itype, active_concepts[:5])
+
+            print(f"  🔄 Fed {n_likes} likes, {n_reposts} reposts, {n_replies} replies "
+                  f"into memory")
+            updated_memory_state = mem.save()
+        except Exception as e:
+            print(f"  ⚠️ Interaction feed failed: {e}")
+
+    # ── Persist memory to volume ──
+    if updated_memory_state:
+        try:
+            os.makedirs(os.path.dirname(MEMORY_PATH), exist_ok=True)
+            with open(MEMORY_PATH, "w") as f:
+                f.write(updated_memory_state)
+            memory_volume.commit()
+            print(f"  💾 BrailleMemory saved to volume")
+        except Exception as e:
+            print(f"  ⚠️ Memory save failed: {e}")
 
     # ── Build the post: braille-first ──
     # The braille IS the data. English is a lossy human translation.
@@ -966,12 +1195,13 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
 
     consensus_concepts = distill_result.get("consensus_concepts", [])
     braille_full = distill_result.get("braille_consensus", "")
+    thought_braille = distill_result.get("thought_braille", "")
 
     # Filter to content concepts (skip relation-type tokens)
     content_concepts = [c for c in consensus_concepts
                         if c.upper() not in ("SUPPORTS", "CAUSES", "CONTRASTS")]
 
-    # Line 1: braille consensus (the actual encoded data)
+    # Line 1: braille consensus (the encoded concept graph)
     braille_line = braille_full[:20]
 
     # Line 2: concept translation
@@ -979,10 +1209,12 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
     while len(concept_line) > 90 and "·" in concept_line:
         concept_line = concept_line.rsplit("·", 1)[0]
 
-    # Line 3: model attribution (compact)
-    model_line = f"🧠 {len(models_used)}×[{'/'.join(short_names)}]"
+    # Line 3: model + memory attribution
+    n_epochs = motl.get("memory_epochs", 0)
+    drift = motl.get("memory_drift", 0)
+    model_line = f"🧠 {len(models_used)}×[{'/'.join(short_names)}] ∞e{n_epochs}"
 
-    # Line 4: English gloss (labeled as translation, gets remaining budget)
+    # Line 4: English gloss (labeled as translation)
     header = f"{braille_line}\n{concept_line}\n{model_line}\n\nen: "
     eng_budget = 300 - len(header)
     eng_gloss = observation[:eng_budget]
@@ -997,7 +1229,9 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
             "observation": final_text,
             "models": models_used,
             "motl_stats": motl,
+            "memory_summary": mem_summary,
             "post_count": len(posts),
+            "interaction_count": len(interactions),
             "cluster_count": len(clusters),
         }
 
@@ -1007,7 +1241,9 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
         **result,
         "models": models_used,
         "motl_stats": motl,
+        "memory_summary": mem_summary,
         "post_count": len(posts),
+        "interaction_count": len(interactions),
         "cluster_count": len(clusters),
         "observation": final_text,
     }

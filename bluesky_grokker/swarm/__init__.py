@@ -11,5 +11,6 @@ from swarm.router import ModelRouter
 from swarm.codec import SemanticCodec
 from swarm.distiller import Distiller
 from swarm.pipeline import SwarmPipeline
+from swarm.memory import BrailleMemory
 
-__all__ = ["ModelRouter", "SemanticCodec", "Distiller", "SwarmPipeline"]
+__all__ = ["ModelRouter", "SemanticCodec", "Distiller", "SwarmPipeline", "BrailleMemory"]
