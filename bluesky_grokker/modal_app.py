@@ -36,17 +36,12 @@ image = (
         "python-dotenv>=1.0.0",
         "numpy>=1.26.0",
     )
+    .add_local_dir("bluesky_grokker/swarm", remote_path="/root/swarm")
 )
 
 # Persistent volume for BrailleMemory state (survives across runs)
 memory_volume = modal.Volume.from_name("braille-memory", create_if_missing=True)
 MEMORY_PATH = "/data/braille_memory.json"
-
-# Mount the swarm package into Modal containers so we can import BrailleMemory
-swarm_mount = modal.Mount.from_local_dir(
-    "bluesky_grokker/swarm",
-    remote_path="/root/swarm",
-)
 
 app = modal.App(
     name="bluesky-grokker-swarm",
@@ -557,22 +552,26 @@ def _decode_relation_tuples(braille: str, codec: TieredConceptCodec) -> list[dic
 
 # ── Swarm distillation on Modal (real MOTL/Z₂⁸ pipeline) ────────────────────
 
-# Expanded model roster — 8 diverse models for richer consensus
+# Model roster — free-tier OpenRouter models (verified live 2026-02-26)
+# Spread across providers to avoid single-provider rate limits
 SWARM_MODELS = [
-    "openai/gpt-4o",
-    "openai/gpt-4o-mini",
-    "anthropic/claude-3.5-sonnet",
-    "anthropic/claude-3-haiku",
-    "google/gemini-2.0-flash-001",
-    "google/gemini-2.0-flash-lite-001",
-    "meta-llama/llama-3.3-70b-instruct",
-    "mistralai/mistral-large-2411",
-    "qwen/qwen-2.5-72b-instruct",
-    "deepseek/deepseek-chat-v3-0324",
+    "meta-llama/llama-3.3-70b-instruct:free",       # most reliable
+    "google/gemma-3-27b-it:free",
+    "google/gemma-3-12b-it:free",
+    "qwen/qwen3-4b:free",
+    "nvidia/nemotron-nano-9b-v2:free",
+    "stepfun/step-3.5-flash:free",
+    "upstage/solar-pro-3:free",
+    "z-ai/glm-4.5-air:free",
+    "arcee-ai/trinity-large-preview:free",
+    "openai/gpt-oss-20b:free",
 ]
 
+# Decoder fallback chain (tried in order until one responds)
+DECODER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
-@app.function(timeout=300, mounts=[swarm_mount])
+
+@app.function(timeout=300)
 def swarm_distill(
     clusters: list[dict],
     window_seconds: int = 30,
@@ -599,9 +598,13 @@ def swarm_distill(
 
     import openai
 
-    # Import BrailleMemory from the mounted swarm package
-    sys.path.insert(0, "/root")
-    from swarm.memory import BrailleMemory
+    # Import BrailleMemory directly (bypass swarm/__init__.py which has local deps)
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("braille_memory", "/root/swarm/memory.py")
+    _mod = importlib.util.module_from_spec(_spec)
+    sys.modules["braille_memory"] = _mod  # register so dataclass can resolve
+    _spec.loader.exec_module(_mod)
+    BrailleMemory = _mod.BrailleMemory
 
     # Load or create memory
     if memory_state:
@@ -667,28 +670,64 @@ def swarm_distill(
 
     model_extractions: list[dict] = []
 
-    def query_model(model: str) -> dict | None:
+    def _extract_json(raw: str) -> dict | None:
+        """Try hard to extract a JSON object from model output."""
+        import re
+        text = raw.strip()
+        # Strip <think>...</think> blocks (qwen3, deepseek)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        # Strip markdown fences
+        if "```" in text:
+            parts = text.split("```")
+            for part in parts:
+                part = part.strip()
+                if part.startswith("json"):
+                    part = part[4:].strip()
+                if part.startswith("{"):
+                    try:
+                        return json.loads(part)
+                    except json.JSONDecodeError:
+                        pass
+        # Direct parse
         try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": extraction_system},
-                    {"role": "user", "content": extraction_user},
-                ],
-                max_tokens=500,
-                temperature=0.4,
-            )
-            raw = (resp.choices[0].message.content or "").strip()
-            # Strip markdown fences if present
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            parsed = json.loads(raw)
-            return {"model": model, "data": parsed, "raw": raw}
+            return json.loads(text)
         except json.JSONDecodeError:
-            # Try to salvage partial JSON
-            return {"model": model, "data": None, "raw": raw, "error": "json_parse"}
-        except Exception as e:
-            return {"model": model, "data": None, "raw": "", "error": str(e)}
+            pass
+        # Find first { ... last }
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+        return None
+
+    def query_model(model: str) -> dict | None:
+        raw = ""
+        for attempt in range(3):
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": extraction_system},
+                        {"role": "user", "content": extraction_user},
+                    ],
+                    max_tokens=400,
+                    temperature=0.4,
+                )
+                raw = (resp.choices[0].message.content or "").strip()
+                parsed = _extract_json(raw)
+                if parsed:
+                    return {"model": model, "data": parsed, "raw": raw}
+                return {"model": model, "data": None, "raw": raw, "error": "json_parse"}
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "rate" in err_str.lower() or "402" in err_str:
+                    time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff
+                    continue
+                return {"model": model, "data": None, "raw": "", "error": err_str}
+        return {"model": model, "data": None, "raw": "", "error": "rate_limited_3x"}
 
     with ThreadPoolExecutor(max_workers=len(SWARM_MODELS)) as pool:
         futures = {pool.submit(query_model, m): m for m in SWARM_MODELS}
@@ -704,13 +743,31 @@ def swarm_distill(
                 print(f"    ✓ {model_short}: {n_concepts} concepts extracted")
             else:
                 err = result.get("error", "unknown")
+                raw_preview = result.get("raw", "")[:200]
                 print(f"    ✗ {model_short}: {err}")
+                if raw_preview and err == "json_parse":
+                    print(f"      raw: {raw_preview!r}")
 
     phase1_ms = (time.monotonic() - t_phase1) * 1000
     print(f"  ⏱  Phase 1: {len(model_extractions)}/{len(SWARM_MODELS)} models responded in {phase1_ms:.0f}ms")
 
     if not model_extractions:
-        raise RuntimeError("All model extractions failed")
+        # Graceful degradation: synthesize a minimal extraction from cluster data
+        print("  ⚠️ All models failed — falling back to cluster-derived extraction")
+        fallback_topics = [c["topic"] for c in clusters[:10]]
+        fallback_data = {
+            "topics": fallback_topics,
+            "entities": [],
+            "sentiments": ["mixed"],
+            "actions": ["discussing"],
+            "relations": [],
+            "insight": f"Bluesky discourse across {total_posts} posts, topics: {', '.join(fallback_topics[:5])}",
+        }
+        model_extractions.append({
+            "model": "fallback/cluster-derived",
+            "data": fallback_data,
+            "raw": json.dumps(fallback_data),
+        })
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PHASE 2: Z₂⁸ Tiered Variable-Width Encoding + Sparse Relation Tuples
@@ -963,20 +1020,30 @@ def swarm_distill(
         "Decode this into a single Bluesky post (max 180 chars):"
     )
 
-    try:
-        final = client.chat.completions.create(
-            model="openai/gpt-4o",
-            messages=[
-                {"role": "system", "content": decode_system},
-                {"role": "user", "content": decode_user},
-            ],
-            max_tokens=100,
-            temperature=0.5,
-        )
-        observation = (final.choices[0].message.content or "").strip().strip('"')
-    except Exception as e:
-        print(f"  ⚠️ GPT-4o decode failed: {e}, falling back to best insight")
+    # Try decoder models in order until one responds
+    decoder_chain = [DECODER_MODEL] + [m for m in SWARM_MODELS if m != DECODER_MODEL]
+    observation = None
+    for dec_model in decoder_chain:
+        try:
+            final = client.chat.completions.create(
+                model=dec_model,
+                messages=[
+                    {"role": "system", "content": decode_system},
+                    {"role": "user", "content": decode_user},
+                ],
+                max_tokens=80,
+                temperature=0.5,
+            )
+            observation = (final.choices[0].message.content or "").strip().strip('"')
+            if observation:
+                print(f"  🔤 Decoded by {dec_model.split('/')[-1]}")
+                break
+        except Exception as e:
+            print(f"  ⚠️ Decoder {dec_model.split('/')[-1]} failed: {e}")
+            continue
+    if not observation:
         observation = all_insights[0] if all_insights else "Swarm consensus failed"
+        print(f"  ⚠️ All decoders failed, using best insight")
 
     phase4_ms = (time.monotonic() - t_phase4) * 1000
     print(f"  🔤 Decoded: {observation}")
@@ -1054,7 +1121,6 @@ def post_to_bluesky(text: str) -> dict:
 @app.function(
     timeout=600,
     volumes={"/data": memory_volume},
-    mounts=[swarm_mount],
 )
 def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
     """End-to-end: firehose → cluster → swarm distill (with memory) → post.
@@ -1066,8 +1132,12 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
     import os
     import sys
 
-    sys.path.insert(0, "/root")
-    from swarm.memory import BrailleMemory
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location("braille_memory", "/root/swarm/memory.py")
+    _mod = importlib.util.module_from_spec(_spec)
+    sys.modules["braille_memory"] = _mod  # register so dataclass can resolve
+    _spec.loader.exec_module(_mod)
+    BrailleMemory = _mod.BrailleMemory
 
     print(f"\n{'='*60}")
     print(f"  BLUESKY-GROKKER SWARM PIPELINE (braille-∞)")
@@ -1185,11 +1255,16 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
     # ── Build the post: braille-first ──
     # The braille IS the data. English is a lossy human translation.
     ABBREVS = {
-        "gpt-4o": "4o", "gpt-4o-mini": "4om",
-        "claude-3.5-sonnet": "son", "claude-3-haiku": "hai",
-        "gemini-2.0-flash-001": "gem", "gemini-2.0-flash-lite-001": "gml",
-        "llama-3.3-70b-instruct": "lla", "mistral-large-2411": "mis",
-        "qwen-2.5-72b-instruct": "qwn", "deepseek-chat-v3-0324": "ds",
+        "gemini-2.0-flash-exp:free": "gem",
+        "gemini-2.0-flash-lite-preview-02-05:free": "gml",
+        "llama-3.3-70b-instruct:free": "lla",
+        "deepseek-chat-v3-0324:free": "ds",
+        "qwen-2.5-72b-instruct:free": "qwn",
+        "mistral-small-3.1-24b-instruct:free": "mis",
+        # Legacy (in case model names come without :free suffix)
+        "gemini-2.0-flash-exp": "gem", "gemini-2.0-flash-lite-preview-02-05": "gml",
+        "llama-3.3-70b-instruct": "lla", "deepseek-chat-v3-0324": "ds",
+        "qwen-2.5-72b-instruct": "qwn", "mistral-small-3.1-24b-instruct": "mis",
     }
     short_names = [ABBREVS.get(m, m[:3]) for m in models_used]
 
@@ -1249,22 +1324,141 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
     }
 
 
+# ── Continuous loop ──────────────────────────────────────────────────────────
+
+
+@app.function(
+    timeout=3600 * 4,  # 4-hour max lifetime
+    volumes={"/data": memory_volume},
+)
+def continuous_run(
+    seconds: int = 20,
+    interval: int = 300,
+    max_loops: int = 48,
+    dry_run: bool = False,
+) -> list[dict]:
+    """The braille-∞ loop.
+
+    Ingest → distill → respond → learn → compact → sleep → repeat.
+
+    Every iteration:
+      1. Captures `seconds` of firehose (posts + interactions)
+      2. Clusters and distills through the swarm (6 free models)
+      3. BrailleMemory learns: ingests concepts, spreads activation, decays, prunes
+      4. Posts the braille-native consensus to Bluesky
+      5. Saves memory to volume (persists across runs)
+      6. Sleeps for `interval` seconds, then repeats
+
+    Args:
+        seconds:   firehose capture window per loop (default 20s)
+        interval:  seconds between loops (default 300 = 5 min)
+        max_loops: maximum iterations before exiting (default 48 = ~4 hours)
+        dry_run:   if True, print but don't post to Bluesky
+    """
+    import time
+
+    results = []
+
+    print(f"\n{'='*60}")
+    print(f"  braille-∞ CONTINUOUS LOOP")
+    print(f"  Window: {seconds}s  Interval: {interval}s  Max: {max_loops} loops")
+    print(f"  Dry run: {dry_run}")
+    print(f"{'='*60}\n")
+
+    for loop_i in range(1, max_loops + 1):
+        loop_start = time.time()
+        print(f"\n{'─'*60}")
+        print(f"  ∞ LOOP {loop_i}/{max_loops}  "
+              f"[{time.strftime('%H:%M:%S UTC', time.gmtime())}]")
+        print(f"{'─'*60}")
+
+        try:
+            result = run_pipeline.remote(seconds=seconds, dry_run=dry_run)
+            results.append({
+                "loop": loop_i,
+                "status": "ok",
+                "observation": result.get("observation", "")[:100],
+                "memory_concepts": result.get("motl_stats", {}).get("memory_concepts", 0),
+                "memory_epochs": result.get("motl_stats", {}).get("memory_epochs", 0),
+                "memory_drift": result.get("motl_stats", {}).get("memory_drift", 0),
+                "post_count": result.get("post_count", 0),
+                "interaction_count": result.get("interaction_count", 0),
+            })
+
+            mc = result.get("motl_stats", {}).get("memory_concepts", 0)
+            me = result.get("motl_stats", {}).get("memory_epochs", 0)
+            md = result.get("motl_stats", {}).get("memory_drift", 0)
+            print(f"\n  ✅ Loop {loop_i} complete: {mc} concepts, "
+                  f"epoch {me}, drift={md:.2f}")
+
+        except Exception as e:
+            print(f"\n  ❌ Loop {loop_i} failed: {e}")
+            results.append({
+                "loop": loop_i,
+                "status": "error",
+                "error": str(e)[:200],
+            })
+
+        # Sleep between loops (skip on last iteration)
+        if loop_i < max_loops:
+            elapsed = time.time() - loop_start
+            sleep_time = max(0, interval - elapsed)
+            if sleep_time > 0:
+                print(f"\n  💤 Sleeping {sleep_time:.0f}s until next loop …")
+                time.sleep(sleep_time)
+
+    print(f"\n{'='*60}")
+    print(f"  braille-∞ COMPLETE: {len(results)} loops")
+    ok = sum(1 for r in results if r["status"] == "ok")
+    print(f"  Succeeded: {ok}  Failed: {len(results) - ok}")
+    if results and results[-1].get("memory_epochs"):
+        print(f"  Final memory: epoch {results[-1]['memory_epochs']}, "
+              f"{results[-1].get('memory_concepts', 0)} concepts")
+    print(f"{'='*60}\n")
+
+    return results
+
+
 # ── CLI entry point ──────────────────────────────────────────────────────────
 
 
 @app.local_entrypoint()
-def main(seconds: int = 30, dry_run: bool = False):
-    """Run the full pipeline from the command line.
+def main(
+    seconds: int = 20,
+    dry_run: bool = False,
+    loop: bool = False,
+    interval: int = 300,
+    max_loops: int = 48,
+):
+    """Run the braille-∞ pipeline.
 
     Examples:
-        modal run modal_app.py                    # 30s window, posts to Bluesky
-        modal run modal_app.py --seconds 60       # 60s window
-        modal run modal_app.py --dry-run           # don't post, just print
+        # Single-shot (one firehose window → one post):
+        modal run bluesky_grokker/modal_app.py
+        modal run bluesky_grokker/modal_app.py --seconds 30 --dry-run
+
+        # Continuous loop (ingest → distill → post → learn → repeat):
+        modal run bluesky_grokker/modal_app.py --loop
+        modal run bluesky_grokker/modal_app.py --loop --interval 600 --max-loops 24
+        modal run bluesky_grokker/modal_app.py --loop --dry-run
     """
-    result = run_pipeline.remote(seconds=seconds, dry_run=dry_run)
-    print("\n📋 Result:")
-    for k, v in result.items():
-        print(f"    {k}: {v}")
+    if loop:
+        results = continuous_run.remote(
+            seconds=seconds,
+            interval=interval,
+            max_loops=max_loops,
+            dry_run=dry_run,
+        )
+        print(f"\n📋 Continuous run complete: {len(results)} loops")
+        for r in results:
+            status = "✅" if r["status"] == "ok" else "❌"
+            print(f"  {status} Loop {r['loop']}: {r.get('observation', r.get('error', ''))[:80]}")
+    else:
+        result = run_pipeline.remote(seconds=seconds, dry_run=dry_run)
+        print("\n📋 Result:")
+        for k, v in result.items():
+            if k != "memory_state":  # don't dump the full JSON
+                print(f"    {k}: {v}")
 
 
 # ── Scheduled cron (every 15 min) ────────────────────────────────────────────
@@ -1273,7 +1467,8 @@ def main(seconds: int = 30, dry_run: bool = False):
 @app.function(
     schedule=modal.Cron("*/15 * * * *"),
     timeout=600,
+    volumes={"/data": memory_volume},
 )
 def scheduled_run():
     """Auto-run every 15 minutes when deployed with `modal deploy`."""
-    return run_pipeline.remote(seconds=30, dry_run=False)
+    return run_pipeline.remote(seconds=20, dry_run=False)
