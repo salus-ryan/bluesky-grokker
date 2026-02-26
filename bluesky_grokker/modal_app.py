@@ -701,6 +701,24 @@ def swarm_distill(
                 return json.loads(text[start:end + 1])
             except json.JSONDecodeError:
                 pass
+        # Truncation repair: model output cut off mid-JSON
+        if start >= 0:
+            fragment = text[start:]
+            # Close any open strings, arrays, and the object
+            # Strip trailing partial tokens
+            for trail in ['"', '",', ', "', ',']:
+                if fragment.rstrip().endswith(trail):
+                    fragment = fragment.rstrip()[:-len(trail)]
+            # Try closing open brackets
+            open_brackets = fragment.count('[') - fragment.count(']')
+            open_braces = fragment.count('{') - fragment.count('}')
+            repair = fragment.rstrip().rstrip(',')
+            repair += ']' * max(0, open_brackets)
+            repair += '}' * max(0, open_braces)
+            try:
+                return json.loads(repair)
+            except json.JSONDecodeError:
+                pass
         return None
 
     def query_model(model: str) -> dict | None:
@@ -713,7 +731,7 @@ def swarm_distill(
                         {"role": "system", "content": extraction_system},
                         {"role": "user", "content": extraction_user},
                     ],
-                    max_tokens=400,
+                    max_tokens=800,
                     temperature=0.4,
                 )
                 raw = (resp.choices[0].message.content or "").strip()
