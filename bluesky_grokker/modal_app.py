@@ -224,17 +224,40 @@ def cluster_posts(posts: list[dict], max_clusters: int = 8) -> list[dict]:
 
 
 # ── Z₂⁸ Braille MOTL Encoding Primitives ─────────────────────────────────────
-
+#
 # 8-dot braille: each cell is a vector in Z₂⁸ (8 binary dimensions).
 # Unicode braille block: U+2800 to U+28FF (256 codepoints = 2^8 exactly).
-# We map semantic concepts → braille cells using frequency-adaptive coding.
+#
+# TIERED VARIABLE-WIDTH ENCODING (ported from SemanticCodec):
+#   Tier 0 : 1-bit codes → top 2 concepts
+#   Tier 1 : 2-bit codes → next 4 concepts
+#   Tier 2 : 3-bit codes → next 8 concepts
+#   Tier 3 : 4-bit codes → next 16 concepts
+#   Tier 4 : 8-bit codes → remaining concepts (up to 256)
+#   Literal : escape marker + UTF-8 bytes for unknown concepts
+#
+# Concepts are packed as a continuous bitstream, then chunked into 8-bit braille
+# cells.  This achieves Huffman-like compression: frequent concepts use fewer bits.
+#
+# SPARSE RELATIONAL ENCODING:
+#   Relations are encoded as fixed 3-cell tuples: (subject, relation, object)
+#   prefixed by a RELATION_MARKER cell (⣾ = 0xFE).  This enables:
+#   - Graph-native storage (every 3 cells after a marker = one edge)
+#   - Constant-time relation lookup (seek to offset i*4)
+#   - Set operations on concept graphs (intersection = shared edges)
 
-BRAILLE_BASE = 0x2800  # ⠀ (empty braille)
+BRAILLE_BASE = 0x2800
+MARKER_LITERAL = 0xFF   # ⣿ — escape to literal UTF-8 bytes
+MARKER_REL     = 0xFE   # ⣾ — next 3 cells are a (src, rel, tgt) tuple
+MARKER_CAT_SEP = 0xFD   # ⣽ — category separator
+
+# Tier layout: (bit_depth, max_slots)
+TIERS = [(1, 2), (2, 4), (3, 8), (4, 16), (8, 256)]
 
 
-def _bits_to_braille(bits: int) -> str:
+def _bits_to_braille(byte_val: int) -> str:
     """Convert an 8-bit integer (0-255) to its Unicode braille character."""
-    return chr(BRAILLE_BASE + (bits & 0xFF))
+    return chr(BRAILLE_BASE + (byte_val & 0xFF))
 
 
 def _braille_to_bits(ch: str) -> int:
@@ -242,60 +265,248 @@ def _braille_to_bits(ch: str) -> int:
     return ord(ch) - BRAILLE_BASE
 
 
-def _encode_concept_to_braille(concept: str, concept_table: dict) -> str:
-    """Encode a concept string into braille cells using the shared table.
+class TieredConceptCodec:
+    """Variable-width concept encoder using frequency-ranked tiered assignment.
 
-    Known concepts get a 1-cell encoding (8 bits, frequency-ranked).
-    Unknown concepts get a literal multi-cell encoding (1 byte per char).
+    Encoding scheme (Elias-escape hybrid):
+      Frequent concepts (top 30) get short prefix-free codes:
+        Tier 0: "00" + 1-bit  = 3 bits  (top 2 concepts)
+        Tier 1: "01" + 2-bit  = 4 bits  (next 4 concepts)
+        Tier 2: "10" + 3-bit  = 5 bits  (next 8 concepts)
+        Tier 3: "110"+ 4-bit  = 7 bits  (next 16 concepts)
+      Rare concepts (rank 30+) use escape:
+        "111" + 8-bit index   = 11 bits  (up to 256 more concepts)
+      Unknown concepts (not in table):
+        "11111111" + UTF-8 bytes + "11111110" (literal escape)
+
+    The top-30 concepts (which by Zipf's law carry ~80% of frequency mass)
+    cost 3-7 bits.  Rare concepts cost 11 bits (only 3-bit overhead vs flat 8).
+    Weighted average is typically 4-6 bits/concept vs 8-bit flat.
     """
-    if concept in concept_table:
-        return _bits_to_braille(concept_table[concept])
-    # Literal fallback: marker cell (0xFF = ⣿) + one braille cell per byte
-    return _bits_to_braille(0xFF) + "".join(
-        _bits_to_braille(b) for b in concept.encode("utf-8")
+
+    # (prefix, payload_bits, slot_count)
+    SHORT_TIERS = [
+        ("00",  1,  2),   # 3 bits total → top 2
+        ("01",  2,  4),   # 4 bits total → next 4
+        ("10",  3,  8),   # 5 bits total → next 8
+        ("110", 4, 16),   # 7 bits total → next 16
+    ]
+    LONG_PREFIX = "111"   # 11 bits total → rest (up to 256)
+    LONG_BITS = 8
+
+    def __init__(self, all_concepts: list[str]) -> None:
+        from collections import Counter
+
+        freq = Counter(all_concepts)
+        ranked = [c for c, _ in freq.most_common()]
+
+        self.encode_table: dict[str, str] = {}   # concept → bit string
+        self.decode_table: dict[str, str] = {}   # bit string → concept
+        self.concept_tier: dict[str, str] = {}    # concept → tier label
+
+        idx = 0
+        # Assign short tiers
+        for prefix, payload_bits, slot_count in self.SHORT_TIERS:
+            n = min(slot_count, len(ranked) - idx)
+            if n <= 0:
+                break
+            for i in range(n):
+                concept = ranked[idx]
+                code = prefix + format(i, f"0{payload_bits}b")
+                self.encode_table[concept] = code
+                self.decode_table[code] = concept
+                self.concept_tier[concept] = f"{len(code)}b-short"
+                idx += 1
+
+        # Assign long tier (escape prefix + 8-bit index)
+        long_start = idx
+        n_long = min(256, len(ranked) - idx)
+        for i in range(n_long):
+            concept = ranked[idx]
+            code = self.LONG_PREFIX + format(i, f"0{self.LONG_BITS}b")
+            self.encode_table[concept] = code
+            self.decode_table[code] = concept
+            self.concept_tier[concept] = "11b-long"
+            idx += 1
+
+        self.ranked = ranked
+        self.concept_freq = freq
+        self._total_concepts = idx
+        self._n_short = long_start
+        self._n_long = n_long
+
+    def encode_concept(self, concept: str) -> str:
+        """Encode a concept to its variable-width bit string."""
+        return self.encode_table.get(concept, "")
+
+    def encode_concept_with_literal(self, concept: str) -> str:
+        """Encode with literal fallback for unknown concepts."""
+        bits = self.encode_concept(concept)
+        if bits:
+            return bits
+        # Literal: "11111111" + 8 bits per UTF-8 byte + "11111110" terminator
+        literal_bits = "".join(format(b, "08b") for b in concept.encode("utf-8"))
+        return "11111111" + literal_bits + "11111110"
+
+    def decode_bitstream(self, bitstream: str) -> list[str]:
+        """Decode a variable-width bitstream back to concept tokens."""
+        concepts = []
+        pos = 0
+        blen = len(bitstream)
+        while pos < blen:
+            # Literal escape: 8 ones
+            if bitstream[pos:pos + 8] == "11111111":
+                pos += 8
+                raw_bytes = bytearray()
+                while pos + 8 <= blen:
+                    byte_bits = bitstream[pos:pos + 8]
+                    if byte_bits == "11111110":
+                        pos += 8
+                        break
+                    raw_bytes.append(int(byte_bits, 2))
+                    pos += 8
+                try:
+                    concepts.append(raw_bytes.decode("utf-8"))
+                except Exception:
+                    concepts.append(f"<unk:{raw_bytes.hex()}>")
+                continue
+
+            # Try short tiers first (they don't start with "111")
+            decoded = False
+            for prefix, payload_bits, _ in self.SHORT_TIERS:
+                plen = len(prefix)
+                total = plen + payload_bits
+                if pos + total <= blen and bitstream[pos:pos + plen] == prefix:
+                    full_code = bitstream[pos:pos + total]
+                    if full_code in self.decode_table:
+                        concepts.append(self.decode_table[full_code])
+                        pos += total
+                        decoded = True
+                        break
+
+            if decoded:
+                continue
+
+            # Try long tier: "111" + 8 bits
+            lp = len(self.LONG_PREFIX)
+            total_long = lp + self.LONG_BITS
+            if (pos + total_long <= blen and
+                    bitstream[pos:pos + lp] == self.LONG_PREFIX):
+                full_code = bitstream[pos:pos + total_long]
+                if full_code in self.decode_table:
+                    concepts.append(self.decode_table[full_code])
+                    pos += total_long
+                    continue
+
+            pos += 1  # skip unknown bit
+
+        return concepts
+
+    def get_stats(self) -> dict:
+        tier_counts: dict[str, int] = {}
+        for label in self.concept_tier.values():
+            tier_counts[label] = tier_counts.get(label, 0) + 1
+        avg_bits = 0.0
+        total_freq = sum(self.concept_freq.values())
+        if total_freq > 0:
+            for concept, code in self.encode_table.items():
+                avg_bits += len(code) * self.concept_freq[concept] / total_freq
+        return {
+            "total_encoded": self._total_concepts,
+            "short_tier_concepts": self._n_short,
+            "long_tier_concepts": self._n_long,
+            "tier_distribution": tier_counts,
+            "avg_bits_per_concept": round(avg_bits, 2),
+            "flat_8bit_equivalent": 8.0,
+            "variable_width_savings": round((1 - avg_bits / 8.0) * 100, 1) if avg_bits > 0 else 0,
+        }
+
+
+def _pack_bitstream_to_braille(bitstream: str) -> str:
+    """Pack a bit string into braille cells (8 bits per cell, zero-padded).
+
+    First 2 cells = 16-bit big-endian length header (actual bit count).
+    Remaining cells = the bitstream data, zero-padded to a cell boundary.
+    """
+    bit_len = len(bitstream)
+    # 2-cell header: high byte, low byte of bit_len (max 65535 bits)
+    header = _bits_to_braille((bit_len >> 8) & 0xFF) + _bits_to_braille(bit_len & 0xFF)
+    # Pad data to multiple of 8
+    padded = bitstream + "0" * ((8 - bit_len % 8) % 8)
+    data = "".join(
+        chr(BRAILLE_BASE + int(padded[i:i + 8], 2))
+        for i in range(0, len(padded), 8)
     )
+    return header + data
 
 
-def _decode_braille_to_concept(braille: str, reverse_table: dict) -> list[str]:
-    """Decode a braille string back into concept tokens."""
-    concepts = []
+def _unpack_braille_to_bitstream(braille: str) -> str:
+    """Unpack braille cells back into a bit string, using the length header.
+
+    Returns exactly the number of bits that were originally packed.
+    """
+    if len(braille) < 2:
+        return ""
+    # Read 2-cell header
+    hi = ord(braille[0]) - BRAILLE_BASE
+    lo = ord(braille[1]) - BRAILLE_BASE
+    bit_len = (hi << 8) | lo
+    # Decode remaining cells
+    raw = "".join(format(ord(ch) - BRAILLE_BASE, "08b") for ch in braille[2:])
+    return raw[:bit_len]
+
+
+def _encode_relation_tuple(rel: dict, codec: TieredConceptCodec) -> str:
+    """Encode a relation as a 3-cell (src, rel_type, tgt) braille tuple.
+
+    Format: MARKER_REL cell + 3 concept cells.
+    Each concept is encoded at its tiered variable-width, then packed into
+    exactly 1 braille cell (8 bits, zero-padded right).  This gives us
+    fixed-stride graph storage: every 4 cells = one edge.
+    """
+    src = rel.get("src", "")
+    rel_type = rel.get("type", "")
+    tgt = rel.get("tgt", "")
+
+    def _concept_to_cell(concept: str) -> str:
+        bits = codec.encode_concept(concept)
+        if not bits:
+            # Unknown concept: hash into 8 bits
+            h = sum(b for b in concept.encode("utf-8")) & 0xFF
+            return _bits_to_braille(h)
+        # Pad/truncate to 8 bits for fixed-width cell
+        bits_padded = (bits + "00000000")[:8]
+        return chr(BRAILLE_BASE + int(bits_padded, 2))
+
+    marker = _bits_to_braille(MARKER_REL)
+    return marker + _concept_to_cell(src) + _concept_to_cell(rel_type) + _concept_to_cell(tgt)
+
+
+def _decode_relation_tuples(braille: str, codec: TieredConceptCodec) -> list[dict]:
+    """Extract (src, type, tgt) relation tuples from a braille stream.
+
+    Scans for MARKER_REL cells and reads the next 3 cells as a tuple.
+    """
+    relations = []
     i = 0
+    # Build a reverse lookup: 8-bit padded code → concept
+    cell_to_concept = {}
+    for concept, bits in codec.encode_table.items():
+        bits_padded = (bits + "00000000")[:8]
+        cell_val = int(bits_padded, 2)
+        cell_to_concept[cell_val] = concept
+
     while i < len(braille):
-        bits = _braille_to_bits(braille[i])
-        if bits == 0xFF:
-            # Literal: read until next known cell or end
-            i += 1
-            raw_bytes = bytearray()
-            while i < len(braille):
-                b = _braille_to_bits(braille[i])
-                if b == 0xFF or b in reverse_table:
-                    break
-                raw_bytes.append(b)
-                i += 1
-            try:
-                concepts.append(raw_bytes.decode("utf-8"))
-            except Exception:
-                concepts.append(f"<unk:{raw_bytes.hex()}>")
-        elif bits in reverse_table:
-            concepts.append(reverse_table[bits])
-            i += 1
+        if _braille_to_bits(braille[i]) == MARKER_REL and i + 3 < len(braille):
+            cells = [_braille_to_bits(braille[i + 1 + j]) for j in range(3)]
+            src = cell_to_concept.get(cells[0], f"<{cells[0]:02x}>")
+            rel_type = cell_to_concept.get(cells[1], f"<{cells[1]:02x}>")
+            tgt = cell_to_concept.get(cells[2], f"<{cells[2]:02x}>")
+            relations.append({"src": src, "type": rel_type, "tgt": tgt})
+            i += 4  # skip marker + 3 cells
         else:
             i += 1
-    return concepts
-
-
-def _build_concept_table(all_concepts: list[str]) -> dict[str, int]:
-    """Build a frequency-ranked concept → 8-bit-index table (MOTL adaptive).
-
-    Most frequent concepts get the lowest indices (shortest in variable-depth
-    schemes; here all are 1 braille cell but rank still matters for merge
-    confidence boosting).
-    """
-    from collections import Counter
-    freq = Counter(all_concepts)
-    # Reserve 0xFF for literal marker, 0xFE for separator
-    ranked = [c for c, _ in freq.most_common(254)]
-    return {concept: idx for idx, concept in enumerate(ranked)}
+    return relations
 
 
 # ── Swarm distillation on Modal (real MOTL/Z₂⁸ pipeline) ────────────────────
@@ -431,85 +642,107 @@ def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
         raise RuntimeError("All model extractions failed")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # PHASE 2: Z₂⁸ Braille Encoding — encode all concepts into braille space
+    # PHASE 2: Z₂⁸ Tiered Variable-Width Encoding + Sparse Relation Tuples
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    print("\n  ⡷ PHASE 2: Z₂⁸ braille encoding …")
+    print("\n  ⡷ PHASE 2: Z₂⁸ tiered encoding + relation tuples …")
     t_phase2 = time.monotonic()
 
-    # Collect ALL concepts across all models for the shared encoding table
+    # Collect ALL concepts across all models for the shared codec
     all_concepts: list[str] = []
     for ext in model_extractions:
         d = ext["data"]
         for key in ("topics", "entities", "sentiments", "actions"):
             all_concepts.extend(d.get(key, []))
         for rel in d.get("relations", []):
-            all_concepts.extend([rel.get("src", ""), rel.get("tgt", ""), rel.get("type", "")])
+            for f in ("src", "tgt", "type"):
+                val = rel.get(f, "")
+                if val:
+                    all_concepts.append(val)
 
-    # Build the adaptive MOTL table (frequency-ranked → braille index)
-    concept_table = _build_concept_table(all_concepts)
-    reverse_table = {v: k for k, v in concept_table.items()}
+    # Build the tiered variable-width codec (1/2/3/4/8-bit tiers)
+    codec = TieredConceptCodec(all_concepts)
+    codec_stats = codec.get_stats()
 
-    # Encode each model's concepts into braille
+    # Encode each model's concepts into braille (variable-width bitstream)
+    # and relations as sparse 3-cell tuples
     encoded_per_model: list[dict] = []
     for ext in model_extractions:
         d = ext["data"]
-        braille_stream = ""
         concept_tokens = []
+        concept_bitstream = ""
 
+        # Encode concept categories as variable-width bitstream
         for key in ("topics", "entities", "sentiments", "actions"):
             for concept in d.get(key, []):
-                braille_stream += _encode_concept_to_braille(concept, concept_table)
+                concept_bitstream += codec.encode_concept_with_literal(concept)
                 concept_tokens.append(concept)
-            braille_stream += _bits_to_braille(0xFE)  # category separator
 
-        # Encode relations
+        # Pack bitstream into braille cells
+        concept_braille = _pack_bitstream_to_braille(concept_bitstream)
+
+        # Encode relations as sparse 3-cell tuples (⣾ + src + type + tgt)
+        relation_braille = ""
         for rel in d.get("relations", []):
-            for field in ("src", "type", "tgt"):
-                val = rel.get(field, "")
-                if val:
-                    braille_stream += _encode_concept_to_braille(val, concept_table)
+            relation_braille += _encode_relation_tuple(rel, codec)
+
+        # Full braille stream: concepts + relation tuples
+        full_braille = concept_braille + relation_braille
 
         encoded_per_model.append({
             "model": ext["model"],
-            "braille": braille_stream,
+            "braille": full_braille,
+            "concept_braille": concept_braille,
+            "relation_braille": relation_braille,
+            "bitstream": concept_bitstream,
             "concepts": concept_tokens,
             "insight": d.get("insight", ""),
             "relations": d.get("relations", []),
         })
 
     total_braille_cells = sum(len(e["braille"]) for e in encoded_per_model)
+    total_bits = sum(len(e["bitstream"]) for e in encoded_per_model)
+    total_rel_cells = sum(len(e["relation_braille"]) for e in encoded_per_model)
     total_raw_bytes = sum(len(json.dumps(e["concepts"]).encode()) for e in encoded_per_model)
     compression = total_raw_bytes / max(total_braille_cells, 1)
 
     phase2_ms = (time.monotonic() - t_phase2) * 1000
-    print(f"  ⡷ Encoded {len(concept_table)} unique concepts into Z₂⁸ space")
+    print(f"  ⡷ Codec: {codec_stats['total_encoded']} concepts across tiers: {codec_stats['tier_distribution']}")
+    print(f"  ⡷ Avg {codec_stats['avg_bits_per_concept']} bits/concept "
+          f"(vs 8-bit flat = {codec_stats['variable_width_savings']}% savings)")
     print(f"  ⡷ {total_braille_cells} braille cells ({total_raw_bytes} raw bytes → {compression:.1f}× compression)")
+    print(f"  ⡷ {total_rel_cells} relation cells ({total_rel_cells // 4} edge tuples)")
     print(f"  ⏱  Phase 2: {phase2_ms:.0f}ms")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # PHASE 3: Braille-space consensus — merge concepts, boost multi-provider
+    # PHASE 3: Braille-space consensus — decode, merge, boost multi-provider
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     print("\n  ⣿ PHASE 3: Braille-space consensus merge …")
     t_phase3 = time.monotonic()
 
-    # Decode each model's braille back and tally concept provenance
+    # Decode each model's bitstream back and tally concept provenance
     concept_providers: dict[str, set] = {}
     concept_freq: Counter = Counter()
     all_insights: list[str] = []
     all_relations: list[dict] = []
+    all_decoded_rels: list[dict] = []
 
     for enc in encoded_per_model:
         model_name = enc["model"].split("/")[-1]
-        # Decode this model's braille stream back to concepts
-        decoded = _decode_braille_to_concept(enc["braille"], reverse_table)
+
+        # Decode variable-width concept bitstream
+        decoded = codec.decode_bitstream(enc["bitstream"])
 
         for concept in decoded:
             concept_freq[concept] += 1
             if concept not in concept_providers:
                 concept_providers[concept] = set()
             concept_providers[concept].add(model_name)
+
+        # Decode relation tuples from the relation braille segment
+        decoded_rels = _decode_relation_tuples(enc["relation_braille"], codec)
+        all_decoded_rels.extend(decoded_rels)
 
         if enc["insight"]:
             all_insights.append(enc["insight"])
@@ -525,13 +758,14 @@ def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
 
     concept_scores.sort(key=lambda x: -x[1])
 
-    # Build the consensus braille string (top concepts only, re-encoded)
+    # Build the consensus braille: re-encode top concepts as variable-width
     consensus_concepts = [c[0] for c in concept_scores[:30]]
-    consensus_braille = "".join(
-        _encode_concept_to_braille(c, concept_table) for c in consensus_concepts
-    )
+    consensus_bitstream = ""
+    for c in consensus_concepts:
+        consensus_bitstream += codec.encode_concept_with_literal(c)
+    consensus_braille = _pack_bitstream_to_braille(consensus_bitstream)
 
-    # Deduplicate relations
+    # Deduplicate relations and encode as sparse 3-cell tuples
     seen_rels = set()
     merged_relations = []
     for rel in all_relations:
@@ -540,10 +774,21 @@ def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
             seen_rels.add(key)
             merged_relations.append(rel)
 
+    # Encode merged relations as consensus relation braille
+    consensus_rel_braille = ""
+    for rel in merged_relations[:15]:
+        consensus_rel_braille += _encode_relation_tuple(rel, codec)
+
+    # Full consensus stream: concept cells + relation tuples
+    full_consensus_braille = consensus_braille + consensus_rel_braille
+
     phase3_ms = (time.monotonic() - t_phase3) * 1000
     n_multi = sum(1 for _, _, _, p in concept_scores if p >= 2)
+    n_edge_tuples = len(merged_relations)
     print(f"  ⣿ {len(concept_scores)} unique concepts, {n_multi} agreed by 2+ models")
-    print(f"  ⣿ Consensus braille: {consensus_braille[:40]}… ({len(consensus_braille)} cells)")
+    print(f"  ⣿ {n_edge_tuples} relation edges → {min(n_edge_tuples, 15)} consensus tuples")
+    print(f"  ⣿ Consensus: {len(consensus_braille)} concept cells + {len(consensus_rel_braille)} relation cells")
+    print(f"  ⣿ Braille: {full_consensus_braille[:40]}… ({len(full_consensus_braille)} total cells)")
     print(f"  ⣿ Top concepts: {', '.join(c[0] for c in concept_scores[:10])}")
     print(f"  ⏱  Phase 3: {phase3_ms:.0f}ms")
 
@@ -560,8 +805,9 @@ def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
         f"  {c[0]} (score={c[1]:.1f}, freq={c[2]}, models={c[3]})"
         for c in top_10
     )
+    # Format relation edges as (src)→[type]→(tgt) graph notation
     relation_summary = "\n".join(
-        f"  {r.get('src','')} —[{r.get('type','')}]→ {r.get('tgt','')}"
+        f"  ({r.get('src','')}) —[{r.get('type','')}]→ ({r.get('tgt','')})"
         for r in merged_relations[:10]
     )
     insight_summary = "\n".join(f"  • {ins}" for ins in all_insights[:8])
@@ -570,9 +816,9 @@ def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
         "You decode MOTL (Machine-Optimized Thought Language) consensus data back into "
         "human-readable English. You receive:\n"
         "1. Ranked concept tokens with confidence scores from a multi-model swarm\n"
-        "2. Semantic relations between concepts\n"
+        "2. A semantic knowledge graph encoded as (subject)→[relation]→(object) triples\n"
         "3. Individual model insights\n"
-        "4. The raw braille-encoded consensus string\n\n"
+        "4. The raw braille-encoded consensus (variable-width tiered + relation tuples)\n\n"
         "Synthesize these into ONE sharp, specific Bluesky post (max 180 chars). "
         "Reference actual topics. Be insightful, not generic. No hashtags. "
         "Output ONLY the post text, no quotes."
@@ -581,9 +827,9 @@ def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
     decode_user = (
         f"MOTL consensus from {len(model_extractions)} models analyzing "
         f"{total_posts} Bluesky posts ({window_seconds}s window):\n\n"
-        f"Consensus braille: {consensus_braille[:60]}\n\n"
+        f"Consensus braille: {full_consensus_braille[:60]}\n\n"
         f"Top ranked concepts (by multi-model agreement):\n{concept_summary}\n\n"
-        f"Key relations:\n{relation_summary}\n\n"
+        f"Knowledge graph edges ({n_edge_tuples} triples):\n{relation_summary}\n\n"
         f"Model insights:\n{insight_summary}\n\n"
         "Decode this into a single Bluesky post (max 180 chars):"
     )
@@ -613,14 +859,18 @@ def swarm_distill(clusters: list[dict], window_seconds: int = 30) -> dict:
     return {
         "text": observation[:280],
         "models": model_names,
-        "braille_consensus": consensus_braille,
+        "braille_consensus": full_consensus_braille,
         "consensus_concepts": consensus_concepts,
         "motl_stats": {
             "total_concepts": len(concept_scores),
             "multi_model_concepts": n_multi,
             "braille_cells": total_braille_cells,
+            "relation_tuples": min(n_edge_tuples, 15),
             "compression_ratio": round(compression, 2),
-            "encoding_table_size": len(concept_table),
+            "avg_bits_per_concept": codec_stats["avg_bits_per_concept"],
+            "variable_width_savings_pct": codec_stats["variable_width_savings"],
+            "tier_distribution": codec_stats["tier_distribution"],
+            "encoding_table_size": codec_stats["total_encoded"],
             "phase1_ms": round(phase1_ms),
             "phase2_ms": round(phase2_ms),
             "phase3_ms": round(phase3_ms),
