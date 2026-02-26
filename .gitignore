@@ -1,0 +1,33 @@
+# Secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Reference repos (cloned for research, not part of this project)
+reference/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Modal
+.modal/
