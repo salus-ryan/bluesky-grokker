@@ -953,8 +953,8 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
           f"{motl.get('multi_model_concepts',0)} multi-model, "
           f"{motl.get('compression_ratio',0)}× compression\n")
 
-    # Build the final post: observation + braille + translation + models
-    # Strategy: build footer first (fixed budget), give rest to observation
+    # ── Build the post: braille-first ──
+    # The braille IS the data. English is a lossy human translation.
     ABBREVS = {
         "gpt-4o": "4o", "gpt-4o-mini": "4om",
         "claude-3.5-sonnet": "son", "claude-3-haiku": "hai",
@@ -963,28 +963,31 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
         "qwen-2.5-72b-instruct": "qwn", "deepseek-chat-v3-0324": "ds",
     }
     short_names = [ABBREVS.get(m, m[:3]) for m in models_used]
-    model_line = f"🧠 {len(models_used)}×[{'/'.join(short_names)}]"
 
     consensus_concepts = distill_result.get("consensus_concepts", [])
     braille_full = distill_result.get("braille_consensus", "")
 
-    # Use top 8 concepts for the braille+translation lines
-    n_show = min(8, len(braille_full), len(consensus_concepts))
-    braille_line = braille_full[:n_show]
-    # Build concept translation, trimming to fit
-    concept_tokens = consensus_concepts[:n_show]
-    # Filter out MOTL relation types (SUPPORTS/CAUSES/CONTRASTS) — keep content concepts
-    content_concepts = [c for c in concept_tokens if c.upper() not in ("SUPPORTS", "CAUSES", "CONTRASTS")]
-    if not content_concepts:
-        content_concepts = concept_tokens[:n_show]
-    concept_line = "·".join(content_concepts)
-    # Cap translation line at 80 chars
-    while len(concept_line) > 80 and "·" in concept_line:
+    # Filter to content concepts (skip relation-type tokens)
+    content_concepts = [c for c in consensus_concepts
+                        if c.upper() not in ("SUPPORTS", "CAUSES", "CONTRASTS")]
+
+    # Line 1: braille consensus (the actual encoded data)
+    braille_line = braille_full[:20]
+
+    # Line 2: concept translation
+    concept_line = "↳ " + "·".join(content_concepts[:8])
+    while len(concept_line) > 90 and "·" in concept_line:
         concept_line = concept_line.rsplit("·", 1)[0]
 
-    footer = f"\n\n⡷ {braille_line}\n↳ {concept_line}\n{model_line}"
-    obs_budget = 300 - len(footer)
-    final_text = f"{observation[:obs_budget]}{footer}"
+    # Line 3: model attribution (compact)
+    model_line = f"🧠 {len(models_used)}×[{'/'.join(short_names)}]"
+
+    # Line 4: English gloss (labeled as translation, gets remaining budget)
+    header = f"{braille_line}\n{concept_line}\n{model_line}\n\nen: "
+    eng_budget = 300 - len(header)
+    eng_gloss = observation[:eng_budget]
+
+    final_text = f"{header}{eng_gloss}"
 
     # Stage 4: Post (or dry-run)
     if dry_run:
