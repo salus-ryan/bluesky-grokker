@@ -106,27 +106,79 @@ def is_nonsemantic(concept: str) -> bool:
 
 # Hand-built alias map: maps variant → canonical form
 _ALIAS_MAP = {
+    # Social media
     "social media": "social media",
     "social": "social media",
     "digital sharing": "social media",
     "sharing online": "social media",
+    "social networking": "social media",
+    "social network": "social media",
+    # Politics
     "us politics": "american politics",
     "u.s. politics": "american politics",
     "american politics": "american politics",
     "usa politics": "american politics",
+    "us government": "american politics",
     "uk economy": "british economy",
     "uk economy decline": "british economy",
     "british economy": "british economy",
+    "uk politics": "british politics",
+    "british politics": "british politics",
+    # Technology
     "ai": "artificial intelligence",
     "a.i.": "artificial intelligence",
     "machine learning": "artificial intelligence",
     "ml": "artificial intelligence",
+    "deep learning": "artificial intelligence",
+    "tech": "technology",
+    "tech industry": "technology",
+    "technology industry": "technology",
+    # Crypto
     "crypto": "cryptocurrency",
     "bitcoin": "cryptocurrency",
     "btc": "cryptocurrency",
+    "ethereum": "cryptocurrency",
+    "eth": "cryptocurrency",
+    # Climate
     "climate change": "climate change",
     "global warming": "climate change",
     "climate crisis": "climate change",
+    "climate emergency": "climate change",
+    # Media / content
+    "video game": "gaming",
+    "video games": "gaming",
+    "videogames": "gaming",
+    "gaming": "gaming",
+    "games": "gaming",
+    "donate": "donations",
+    "donation": "donations",
+    "donations": "donations",
+    "donating": "donations",
+    # Emotions (collapse near-synonyms)
+    "frustrated": "frustration",
+    "frustrating": "frustration",
+    "frustration": "frustration",
+    "angry": "anger",
+    "furious": "anger",
+    "excited": "excitement",
+    "exciting": "excitement",
+    "excitement": "excitement",
+    "happy": "happiness",
+    "happiness": "happiness",
+    "joyful": "happiness",
+    # Economy
+    "economy": "economy",
+    "economic": "economy",
+    "economics": "economy",
+    "financial": "finance",
+    "finance": "finance",
+    "stock market": "finance",
+    "stocks": "finance",
+    # Healthcare
+    "health care": "healthcare",
+    "healthcare": "healthcare",
+    "medical": "healthcare",
+    "health": "healthcare",
 }
 
 # Regex-based normalizations applied in order
@@ -226,13 +278,22 @@ class ConceptNode:
     last_seen: float = 0.0       # epoch timestamp
     categories: Set[str] = field(default_factory=set)  # topics, entities, etc.
     interaction_boosts: float = 0.0  # accumulated from likes/reposts
+    nonsemantic: bool = False  # stop-concept: excluded from codebook/seeds/drift
+    tier_hint: int = -1  # last codec tier index (0-4), -1 = unassigned; for hysteresis
 
     @property
     def effective_weight(self) -> float:
         return self.weight + self.interaction_boosts
 
+    @property
+    def semantic_weight(self) -> float:
+        """Weight for codebook/consensus purposes — zero if nonsemantic."""
+        if self.nonsemantic:
+            return 0.0
+        return self.weight + self.interaction_boosts
+
     def to_dict(self) -> dict:
-        return {
+        d = {
             "w": round(self.weight, 4),
             "f": self.frequency,
             "p": list(self.providers),
@@ -240,6 +301,11 @@ class ConceptNode:
             "cat": list(self.categories),
             "ib": round(self.interaction_boosts, 4),
         }
+        if self.nonsemantic:
+            d["ns"] = True
+        if self.tier_hint >= 0:
+            d["th"] = self.tier_hint
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "ConceptNode":
@@ -250,6 +316,8 @@ class ConceptNode:
             last_seen=d.get("ts", 0.0),
             categories=set(d.get("cat", [])),
             interaction_boosts=d.get("ib", 0.0),
+            nonsemantic=d.get("ns", False),
+            tier_hint=d.get("th", -1),
         )
 
 
@@ -365,9 +433,10 @@ class BrailleMemory:
                     canonical = mem_match
                     n_canonicalized += 1
 
-                # Non-semantic filter: penalize but don't discard
+                # Non-semantic filter: penalize weight AND mark the node
                 signal = self.SIGNAL_POST
-                if is_nonsemantic(canonical):
+                _is_nonsem = is_nonsemantic(canonical)
+                if _is_nonsem:
                     signal *= NONSEMANTIC_WEIGHT_PENALTY
                     n_filtered += 1
 
@@ -381,14 +450,19 @@ class BrailleMemory:
                 node.providers.add(provider)
                 node.last_seen = now
                 node.categories.add(category)
+                if _is_nonsem:
+                    node.nonsemantic = True
                 n_concepts += 1
 
         # Ingest relations (with canonicalized endpoints)
+        # Skip relations where either endpoint is nonsemantic
         for rel in relations:
             src = canonicalize_concept(rel.get("src") or "")
             rtype = (rel.get("type") or "").upper().strip()
             tgt = canonicalize_concept(rel.get("tgt") or "")
             if not (src and rtype and tgt):
+                continue
+            if is_nonsemantic(src) or is_nonsemantic(tgt):
                 continue
 
             # Map to memory-space concepts
@@ -518,13 +592,15 @@ class BrailleMemory:
         """
         decay_stats = self.apply_decay()
 
-        # Rank concepts by effective weight
+        # Rank concepts by effective weight — exclude nonsemantic from top-k
         ranked = sorted(
             self.concepts.items(),
             key=lambda x: x[1].effective_weight,
             reverse=True,
         )
-        top_concepts = [c for c, _ in ranked[:20]]
+        # Drift top-k uses only semantic concepts
+        semantic_ranked = [(c, n) for c, n in ranked if not n.nonsemantic]
+        top_concepts = [c for c, _ in semantic_ranked[:20]]
 
         # Drift score: how much did the top-20 change since last epoch?
         drift = 0.0
@@ -534,8 +610,8 @@ class BrailleMemory:
             if prev_top or curr_top:
                 drift = 1.0 - len(prev_top & curr_top) / max(len(prev_top | curr_top), 1)
 
-        # Compute average bits/concept from the weight distribution
-        avg_bits = self._estimate_avg_bits(ranked)
+        # Compute average bits/concept from semantic weight distribution only
+        avg_bits = self._estimate_avg_bits(semantic_ranked)
 
         epoch = Epoch(
             timestamp=time.time(),
@@ -559,7 +635,12 @@ class BrailleMemory:
         return epoch
 
     def _estimate_avg_bits(self, ranked: list) -> float:
-        """Estimate avg bits/concept under the tiered codec for this distribution."""
+        """Estimate expected bits per concept *reference* under the tiered codec.
+
+        This weights by usage frequency (effective_weight), not per unique
+        concept.  E[L] = Σ P(c) · L(c), where P(c) = w(c) / Σw.
+        This correctly reflects real payload cost.
+        """
         # Tier layout mirrors TieredConceptCodec
         tiers = [(3, 2), (4, 4), (5, 8), (7, 16)]  # (bits, slots)
         long_bits = 11
@@ -568,21 +649,22 @@ class BrailleMemory:
         if total_weight == 0:
             return 8.0
 
-        avg = 0.0
+        # Assign tier bits to concepts in rank order
+        concept_bits: list[tuple[float, int]] = []  # (weight, bits)
         idx = 0
         for bits, slots in tiers:
             for _ in range(slots):
                 if idx >= len(ranked):
                     break
-                w = ranked[idx][1].effective_weight / total_weight
-                avg += bits * w
+                concept_bits.append((ranked[idx][1].effective_weight, bits))
                 idx += 1
 
         # Remaining concepts at long tier
         for i in range(idx, len(ranked)):
-            w = ranked[i][1].effective_weight / total_weight
-            avg += long_bits * w
+            concept_bits.append((ranked[i][1].effective_weight, long_bits))
 
+        # E[L] = Σ P(c) · L(c)
+        avg = sum(w * b for w, b in concept_bits) / total_weight
         return avg
 
     def _prune_to_capacity(self) -> None:
@@ -700,10 +782,12 @@ class BrailleMemory:
         activated: Dict[str, float] = {}
         paths: List[str] = []
 
-        # Seed activation
+        # Seed activation — skip nonsemantic concepts
         for concept in seed_concepts:
             c = concept.lower().strip()
             node = self.concepts.get(c)
+            if node and node.nonsemantic:
+                continue  # stop-concepts don't seed activation
             if node:
                 activated[c] = node.effective_weight
             else:
@@ -781,6 +865,21 @@ class BrailleMemory:
                 braille += chr(BRAILLE_BASE + h)
 
         return braille
+
+    # ── Stop-concept housekeeping ───────────────────────────────────────
+
+    def mark_nonsemantic_concepts(self) -> int:
+        """Retroactively scan and mark all nonsemantic concepts.
+
+        Called on load to clean up legacy data from before the filter existed.
+        Returns number of concepts newly marked.
+        """
+        marked = 0
+        for concept, node in self.concepts.items():
+            if not node.nonsemantic and is_nonsemantic(concept):
+                node.nonsemantic = True
+                marked += 1
+        return marked
 
     # ── Foundational knowledge: the system's own architecture thesis ─────
 
@@ -872,10 +971,11 @@ class BrailleMemory:
 
     # ── Query: what does the memory know right now? ──────────────────────
 
-    def top_concepts(self, n: int = 20) -> List[Tuple[str, float]]:
-        """Return the top N concepts by effective weight."""
+    def top_concepts(self, n: int = 20, include_nonsemantic: bool = False) -> List[Tuple[str, float]]:
+        """Return the top N concepts by effective weight (semantic only by default)."""
         ranked = sorted(
-            self.concepts.items(),
+            ((c, node) for c, node in self.concepts.items()
+             if include_nonsemantic or not node.nonsemantic),
             key=lambda x: x[1].effective_weight,
             reverse=True,
         )

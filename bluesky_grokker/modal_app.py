@@ -291,6 +291,7 @@ BRAILLE_BASE = 0x2800
 MARKER_LITERAL = 0xFF   # ⣿ — escape to literal UTF-8 bytes
 MARKER_REL     = 0xFE   # ⣾ — next 3 cells are a (src, rel, tgt) tuple
 MARKER_CAT_SEP = 0xFD   # ⣽ — category separator
+MARKER_MOTIF   = 0xFC   # ⣼ — motif reference: motif_id + N binding cells
 
 # Tier layout: (bit_depth, max_slots)
 TIERS = [(1, 2), (2, 4), (3, 8), (4, 16), (8, 256)]
@@ -335,17 +336,44 @@ class TieredConceptCodec:
     LONG_PREFIX = "111"   # 11 bits total → rest (up to 256)
     LONG_BITS = 8
 
-    def __init__(self, all_concepts: list[str]) -> None:
+    # Tier boundaries: cumulative slot counts [2, 6, 14, 30]
+    _TIER_BOUNDARIES = [2, 6, 14, 30]
+
+    def __init__(self, all_concepts: list[str],
+                 tier_hints: dict[str, int] | None = None) -> None:
+        """Build codec from concept frequency, with optional hysteresis.
+
+        tier_hints: {concept → previous_tier_index (0-4)} from BrailleMemory.
+        Concepts already in a short tier get a ranking boost to resist
+        demotion, reducing codebook churn across epochs.
+        """
         from collections import Counter
 
         freq = Counter(all_concepts)
-        ranked = [c for c, _ in freq.most_common()]
+
+        # Apply hysteresis: boost frequency of concepts that were in short tiers
+        # so they resist demotion unless significantly outranked
+        if tier_hints:
+            boosted_freq = {}
+            for concept, count in freq.items():
+                prev_tier = tier_hints.get(concept, -1)
+                if 0 <= prev_tier <= 3:
+                    # Boost: concepts in shorter tiers get stronger retention
+                    boost = (4 - prev_tier) * 0.5  # tier 0 → +2.0, tier 3 → +0.5
+                    boosted_freq[concept] = count + boost
+                else:
+                    boosted_freq[concept] = count
+            ranked = sorted(boosted_freq, key=lambda c: boosted_freq[c], reverse=True)
+        else:
+            ranked = [c for c, _ in freq.most_common()]
 
         self.encode_table: dict[str, str] = {}   # concept → bit string
         self.decode_table: dict[str, str] = {}   # bit string → concept
         self.concept_tier: dict[str, str] = {}    # concept → tier label
+        self.concept_tier_idx: dict[str, int] = {}  # concept → tier index (0-4)
 
         idx = 0
+        tier_idx = 0
         # Assign short tiers
         for prefix, payload_bits, slot_count in self.SHORT_TIERS:
             n = min(slot_count, len(ranked) - idx)
@@ -357,7 +385,9 @@ class TieredConceptCodec:
                 self.encode_table[concept] = code
                 self.decode_table[code] = concept
                 self.concept_tier[concept] = f"{len(code)}b-short"
+                self.concept_tier_idx[concept] = tier_idx
                 idx += 1
+            tier_idx += 1
 
         # Assign long tier (escape prefix + 8-bit index)
         long_start = idx
@@ -368,6 +398,7 @@ class TieredConceptCodec:
             self.encode_table[concept] = code
             self.decode_table[code] = concept
             self.concept_tier[concept] = "11b-long"
+            self.concept_tier_idx[concept] = 4  # long tier
             idx += 1
 
         self.ranked = ranked
@@ -523,6 +554,46 @@ def _encode_relation_tuple(rel: dict, codec: TieredConceptCodec) -> str:
     return marker + _concept_to_cell(src) + _concept_to_cell(rel_type) + _concept_to_cell(tgt)
 
 
+def _encode_motif(motif: dict, codec: TieredConceptCodec, motif_id: int) -> str:
+    """Encode a star motif as a compact braille sequence.
+
+    Format: MARKER_MOTIF + motif_id_cell + hub_cell + n_bindings_cell + binding_cells
+    A star motif "hub→[TYPE]→{a,b,c}" becomes 4+N cells instead of 4*N cells.
+    Savings: (4*N) - (4+N) = 3*N - 4 cells saved (profitable when N >= 2).
+    """
+    hub = motif.get("hub", "")
+    edges = motif.get("edges", [])
+    if not hub or len(edges) < 2:
+        return ""
+
+    def _concept_to_cell(concept: str) -> str:
+        bits = codec.encode_concept(concept)
+        if not bits:
+            h = sum(b for b in concept.encode("utf-8")) & 0xFF
+            return _bits_to_braille(h)
+        bits_padded = (bits + "00000000")[:8]
+        return chr(BRAILLE_BASE + int(bits_padded, 2))
+
+    marker = _bits_to_braille(MARKER_MOTIF)
+    id_cell = _bits_to_braille(motif_id & 0xFF)
+    hub_cell = _concept_to_cell(hub)
+    n_cell = _bits_to_braille(len(edges) & 0xFF)
+
+    # Binding cells: the varying endpoints of the star
+    binding_cells = ""
+    for edge_key in edges:
+        parts = edge_key.split("→")
+        if len(parts) != 3:
+            continue
+        src, rtype, tgt = parts
+        # For star_out: hub is src, bindings are tgt
+        # For star_in: hub is tgt, bindings are src
+        binding = tgt if src == hub else src
+        binding_cells += _concept_to_cell(binding)
+
+    return marker + id_cell + hub_cell + n_cell + binding_cells
+
+
 def _decode_relation_tuples(braille: str, codec: TieredConceptCodec) -> list[dict]:
     """Extract (src, type, tgt) relation tuples from a braille stream.
 
@@ -624,6 +695,11 @@ def swarm_distill(
     if thesis_result["seeded_concepts"] > 0:
         print(f"  🧬 Seeded architecture thesis: {thesis_result['seeded_concepts']} concepts, "
               f"{thesis_result['seeded_relations']} relations")
+
+    # Retroactively mark legacy nonsemantic concepts (www, https, com, etc.)
+    n_marked = memory.mark_nonsemantic_concepts()
+    if n_marked > 0:
+        print(f"  🚫 Marked {n_marked} legacy concepts as nonsemantic")
 
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
@@ -860,9 +936,21 @@ def swarm_distill(
     if n_nonsem_filtered > 0:
         print(f"  ⡷ Filtered {n_nonsem_filtered} non-semantic tokens from codec tiers")
 
-    # Build the tiered variable-width codec (1/2/3/4/8-bit tiers)
-    codec = TieredConceptCodec(all_concepts)
+    # Build tier hints from memory for codebook hysteresis
+    tier_hints = {}
+    for c, node in memory.concepts.items():
+        if node.tier_hint >= 0 and not node.nonsemantic:
+            tier_hints[c] = node.tier_hint
+
+    # Build the tiered variable-width codec (1/2/3/4/8-bit tiers) with hysteresis
+    codec = TieredConceptCodec(all_concepts, tier_hints=tier_hints if tier_hints else None)
     codec_stats = codec.get_stats()
+
+    # Update memory with new tier assignments (persists for next epoch's hysteresis)
+    for concept, tier_idx in codec.concept_tier_idx.items():
+        node = memory.concepts.get(concept)
+        if node is not None:
+            node.tier_hint = tier_idx
 
     # Encode each model's concepts into braille (variable-width bitstream)
     # and relations as sparse 3-cell tuples
@@ -997,20 +1085,43 @@ def swarm_distill(
             seen_rels.add(key)
             merged_relations.append(rel)
 
-    # Encode merged relations as consensus relation braille
-    consensus_rel_braille = ""
-    for rel in merged_relations[:15]:
-        consensus_rel_braille += _encode_relation_tuple(rel, codec)
+    # Motif-aware relation encoding:
+    # Check if any detected motifs cover merged relations; encode as motif if profitable
+    motifs_for_encoding = memory.detect_motifs(min_count=2, top_k=5)
+    motif_covered_keys = set()
+    consensus_motif_braille = ""
+    n_motif_encoded = 0
 
-    # Full consensus stream: concept cells + relation tuples
-    full_consensus_braille = consensus_braille + consensus_rel_braille
+    for mid, motif in enumerate(motifs_for_encoding):
+        if motif["type"].startswith("star") and motif["count"] >= 2:
+            motif_braille = _encode_motif(motif, codec, mid)
+            if motif_braille:
+                consensus_motif_braille += motif_braille
+                motif_covered_keys.update(motif["edges"])
+                n_motif_encoded += 1
+
+    # Encode remaining relations not covered by motifs
+    consensus_rel_braille = ""
+    n_individual_rels = 0
+    for rel in merged_relations[:15]:
+        key = f"{rel.get('src','')}→{rel.get('type','')}→{rel.get('tgt','')}"
+        if key not in motif_covered_keys:
+            consensus_rel_braille += _encode_relation_tuple(rel, codec)
+            n_individual_rels += 1
+
+    # Full consensus stream: concept cells + motif cells + individual relation tuples
+    full_consensus_braille = consensus_braille + consensus_motif_braille + consensus_rel_braille
 
     phase3_ms = (time.monotonic() - t_phase3) * 1000
     n_multi = sum(1 for _, _, _, p in concept_scores if p >= 2)
     n_edge_tuples = len(merged_relations)
+    motif_savings = (len(motif_covered_keys) * 4) - len(consensus_motif_braille) if consensus_motif_braille else 0
     print(f"  ⣿ {len(concept_scores)} unique concepts, {n_multi} agreed by 2+ models")
-    print(f"  ⣿ {n_edge_tuples} relation edges → {min(n_edge_tuples, 15)} consensus tuples")
-    print(f"  ⣿ Consensus: {len(consensus_braille)} concept cells + {len(consensus_rel_braille)} relation cells")
+    print(f"  ⣿ {n_edge_tuples} relation edges → {n_individual_rels} tuples + {n_motif_encoded} motifs")
+    if motif_savings > 0:
+        print(f"  ⣿ Motif compression saved {motif_savings} cells")
+    print(f"  ⣿ Consensus: {len(consensus_braille)} concept cells + "
+          f"{len(consensus_motif_braille)} motif cells + {len(consensus_rel_braille)} relation cells")
     print(f"  ⣿ Braille: {full_consensus_braille[:40]}… ({len(full_consensus_braille)} total cells)")
     print(f"  ⣿ Top concepts: {', '.join(c[0] for c in concept_scores[:10])}")
     print(f"  ⏱  Phase 3: {phase3_ms:.0f}ms")
