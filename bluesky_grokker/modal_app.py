@@ -1108,7 +1108,7 @@ def swarm_distill(
 # ── Post to Bluesky ──────────────────────────────────────────────────────────
 
 
-@app.function(timeout=30)
+@app.function(timeout=120)
 def post_to_bluesky(text: str) -> dict:
     """Post the distilled observation to Bluesky."""
     import os
