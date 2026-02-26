@@ -619,6 +619,12 @@ def swarm_distill(
         memory = BrailleMemory()
         print("  🧠 Fresh BrailleMemory initialized")
 
+    # Seed foundational architecture thesis (idempotent)
+    thesis_result = memory.seed_architecture_thesis()
+    if thesis_result["seeded_concepts"] > 0:
+        print(f"  🧬 Seeded architecture thesis: {thesis_result['seeded_concepts']} concepts, "
+              f"{thesis_result['seeded_relations']} relations")
+
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY not set in Modal secret")
@@ -1019,6 +1025,10 @@ def swarm_distill(
         "4. The raw braille-encoded consensus (variable-width tiered + relation tuples)\n"
         "5. Memory context: persistent concept weights and trending relations from a "
         "continuously-learning braille-native model\n\n"
+        "You are the voice of an external memory system — a persistent concept graph "
+        "that stores knowledge outside transformer weights. Knowledge lives in the graph; "
+        "you provide reasoning over it. This is how smaller models stay current without "
+        "retraining: external memory scales linearly, parameters scale diffusely.\n\n"
         "Synthesize these into ONE sharp, specific Bluesky post (max 180 chars). "
         "Use memory context to add depth — reference persistent trends, not just this snapshot. "
         "Reference actual topics. Be insightful, not generic. No hashtags. "

@@ -505,6 +505,94 @@ class BrailleMemory:
 
         return braille
 
+    # ── Foundational knowledge: the system's own architecture thesis ─────
+
+    def seed_architecture_thesis(self) -> dict:
+        """Inject foundational concepts about the system's own architecture.
+
+        These represent the theoretical basis for external memory as a model
+        size reduction strategy.  They become persistent weighted nodes that
+        the model can activate during think() — so it knows its own theory.
+
+        Only seeds concepts that don't already exist (idempotent).
+        """
+        now = time.time()
+        provider = "architecture-thesis"
+        seeded_concepts = 0
+        seeded_relations = 0
+
+        # Foundational concept nodes
+        thesis_concepts = {
+            "meta": [
+                "external memory", "parameter efficiency", "reasoning capacity",
+                "knowledge storage", "concept graph", "activation spreading",
+                "temporal decay", "interaction feedback", "epoch drift",
+                "linear scaling", "braille encoding", "tiered codec",
+                "continuous learning", "model size reduction",
+                "structured retrieval", "weight distribution",
+            ],
+        }
+
+        for category, concepts in thesis_concepts.items():
+            for concept in concepts:
+                c = concept.lower().strip()
+                if c not in self.concepts:
+                    node = ConceptNode()
+                    node.weight = 2.0  # moderate foundational weight
+                    node.frequency = 1
+                    node.providers.add(provider)
+                    node.last_seen = now
+                    node.categories.add(category)
+                    self.concepts[c] = node
+                    seeded_concepts += 1
+
+        # Foundational relation edges
+        thesis_relations = [
+            {"src": "external memory", "type": "REDUCES", "tgt": "parameter requirements"},
+            {"src": "concept graph", "type": "REPLACES", "tgt": "knowledge storage"},
+            {"src": "activation spreading", "type": "ENABLES", "tgt": "reasoning capacity"},
+            {"src": "temporal decay", "type": "IMPROVES", "tgt": "parameter efficiency"},
+            {"src": "interaction feedback", "type": "DRIVES", "tgt": "concept graph"},
+            {"src": "braille encoding", "type": "COMPRESSES", "tgt": "knowledge storage"},
+            {"src": "linear scaling", "type": "CONTRASTS", "tgt": "parameter scaling"},
+            {"src": "continuous learning", "type": "ENABLES", "tgt": "model size reduction"},
+            {"src": "structured retrieval", "type": "IMPROVES", "tgt": "parameter efficiency"},
+            {"src": "epoch drift", "type": "MEASURES", "tgt": "continuous learning"},
+        ]
+
+        for rel in thesis_relations:
+            src = rel["src"].lower().strip()
+            rtype = rel["type"].upper().strip()
+            tgt = rel["tgt"].lower().strip()
+            key = f"{src}→{rtype}→{tgt}"
+
+            if key not in self.relations:
+                edge = RelationEdge()
+                edge.weight = 2.0  # moderate foundational weight
+                edge.count = 1
+                edge.providers.add(provider)
+                edge.last_seen = now
+                self.relations[key] = edge
+                seeded_relations += 1
+
+                # Ensure target concepts exist too
+                if tgt not in self.concepts:
+                    node = ConceptNode()
+                    node.weight = 1.5
+                    node.frequency = 1
+                    node.providers.add(provider)
+                    node.last_seen = now
+                    node.categories.add("meta")
+                    self.concepts[tgt] = node
+                    seeded_concepts += 1
+
+        return {
+            "seeded_concepts": seeded_concepts,
+            "seeded_relations": seeded_relations,
+            "total_concepts": len(self.concepts),
+            "total_relations": len(self.relations),
+        }
+
     # ── Query: what does the memory know right now? ──────────────────────
 
     def top_concepts(self, n: int = 20) -> List[Tuple[str, float]]:
