@@ -197,7 +197,20 @@ def cluster_posts(posts: list[dict], max_clusters: int = 8) -> list[dict]:
         "over said same see she some still such take tell than that the their "
         "them then there these they thing this those through time up us use "
         "want was way well were what when which who will with would year rt "
-        "dont im ive thats youre weve theyre dont cant wont hes shes".split()
+        "dont im ive thats youre weve theyre dont cant wont hes shes "
+        # Web/URL fragments that leak through post text
+        "com org net http https www html bsky app "
+        # Common contractions with apostrophes
+        "don't i'm it's i've you're we're they're can't won't he's she's "
+        "that's what's there's here's who's how's let's isn't aren't wasn't "
+        "weren't doesn't didn't hasn't haven't hadn't wouldn't couldn't "
+        "shouldn't mustn't shan't "
+        # Generic high-frequency low-signal words
+        "going really think know people right look feel need actually "
+        "literally getting pretty someone something everything nothing "
+        "anything always never maybe probably gonna gotta lol lmao "
+        "after before more less just one two three all any every each "
+        "post reply thread follow share repost".split()
     )
 
     def tokenise(text: str) -> list[str]:
@@ -628,19 +641,15 @@ def _decode_relation_tuples(braille: str, codec: TieredConceptCodec) -> list[dic
 
 # ── Swarm distillation on Modal (real MOTL/Z₂⁸ pipeline) ────────────────────
 
-# Model roster — free-tier OpenRouter models (verified live 2026-02-26)
-# Spread across providers to avoid single-provider rate limits
+# Model roster — free-tier OpenRouter models
+# Trimmed to reliably responding models (verified 2026-02-26 epochs 23-24).
+# Fewer models = faster Phase 1 (~15s vs ~40s) with same consensus quality.
 SWARM_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",       # most reliable
-    "google/gemma-3-27b-it:free",
-    "google/gemma-3-12b-it:free",
-    "qwen/qwen3-4b:free",
-    "nvidia/nemotron-nano-9b-v2:free",
-    "stepfun/step-3.5-flash:free",
-    "upstage/solar-pro-3:free",
-    "z-ai/glm-4.5-air:free",
-    "arcee-ai/trinity-large-preview:free",
-    "openai/gpt-oss-20b:free",
+    "meta-llama/llama-3.3-70b-instruct:free",       # most reliable, 40-55 concepts
+    "google/gemma-3-27b-it:free",                    # consistent, 40-43 concepts
+    "arcee-ai/trinity-large-preview:free",           # highest yield, 60-90 concepts
+    "qwen/qwen3-4b:free",                            # backup — sometimes rate-limited
+    "google/gemma-3-12b-it:free",                    # backup — occasionally 400s
 ]
 
 # Decoder fallback chain (tried in order until one responds)
