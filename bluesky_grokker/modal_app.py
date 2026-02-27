@@ -127,19 +127,35 @@ def capture_firehose(seconds: int = 30) -> dict:
 
                 # Extract image blob URLs if present
                 image_urls = []
-                embed = raw.get("embed", {})
+                image_alts = []
+                embed = raw.get("embed") or {}
                 embed_type = embed.get("$type", "") if isinstance(embed, dict) else ""
                 images_list = []
                 if embed_type == "app.bsky.embed.images":
                     images_list = embed.get("images", [])
                 elif embed_type == "app.bsky.embed.recordWithMedia":
-                    media = embed.get("media", {})
+                    media = embed.get("media") or {}
                     if media.get("$type") == "app.bsky.embed.images":
                         images_list = media.get("images", [])
                 for img in images_list[:2]:  # max 2 images per post
-                    blob = img.get("image", {})
-                    ref = blob.get("ref", {})
-                    cid = ref.get("$link", "") if isinstance(ref, dict) else ""
+                    # Alt text is a free caption from the poster
+                    alt = (img.get("alt") or "").strip()
+                    if alt:
+                        image_alts.append(alt)
+                    # Resolve blob ref → CDN URL
+                    blob = img.get("image") or {}
+                    ref = blob.get("ref")
+                    cid = ""
+                    if isinstance(ref, dict):
+                        cid = ref.get("$link", "")
+                    elif isinstance(ref, str):
+                        cid = ref
+                    elif hasattr(ref, "link"):
+                        # CID object from atproto
+                        cid = str(ref.link) if hasattr(ref, "link") else str(ref)
+                    if not cid:
+                        # Try CID from blob directly
+                        cid = str(blob.get("cid", "")) or ""
                     if cid:
                         url = (f"https://cdn.bsky.app/img/feed_thumbnail/plain/"
                                f"{commit.repo}/{cid}@jpeg")
@@ -155,6 +171,8 @@ def capture_firehose(seconds: int = 30) -> dict:
                     }
                     if image_urls:
                         post_data["image_urls"] = image_urls
+                    if image_alts:
+                        post_data["image_alts"] = image_alts
                     posts.append(post_data)
                     if is_reply:
                         interactions.append({
@@ -191,8 +209,13 @@ def capture_firehose(seconds: int = 30) -> dict:
         pass  # client.stop() causes a benign exception
 
     n_with_images = sum(1 for p in posts if p.get("image_urls"))
+    n_with_alts = sum(1 for p in posts if p.get("image_alts"))
     total_images = sum(len(p.get("image_urls", [])) for p in posts)
-    print(f"📦 Captured {len(posts)} posts ({n_with_images} with images, {total_images} total images), "
+    total_alts = sum(len(p.get("image_alts", [])) for p in posts)
+    img_str = ""
+    if n_with_images or n_with_alts:
+        img_str = f" ({n_with_images} with image URLs, {n_with_alts} with alt text)"
+    print(f"📦 Captured {len(posts)} posts{img_str}, "
           f"{len(interactions)} interactions "
           f"({sum(1 for i in interactions if i['type']=='like')} likes, "
           f"{sum(1 for i in interactions if i['type']=='repost')} reposts, "
@@ -211,13 +234,14 @@ VISION_MODELS = [
 
 @app.function(timeout=120)
 def caption_images(posts: list[dict], max_images: int = 15) -> list[dict]:
-    """Caption images from Bluesky posts using free vision models.
+    """Caption images from Bluesky posts.
 
-    Takes posts with image_urls, returns a list of
-    {"post_uri": ..., "image_url": ..., "caption": ..., "model": ...}
+    Strategy (cheapest first):
+      1. Alt text — free, human-written, often high quality
+      2. Vision model — free-tier OpenRouter for images with URLs but no alt text
 
-    Cost: $0.00 (free-tier OpenRouter vision models).
-    Budget: max_images per run to bound latency (~2s each).
+    Returns [{"post_uri": ..., "caption": ..., "source": "alt"|"vision", ...}]
+    Cost: $0.00 (alt text is free; vision models are free tier).
     """
     import os
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -225,83 +249,96 @@ def caption_images(posts: list[dict], max_images: int = 15) -> list[dict]:
     import openai
 
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        return []
-
-    client = openai.OpenAI(
-        api_key=api_key,
-        base_url="https://openrouter.ai/api/v1",
-    )
-
-    # Collect (post_uri, image_url) pairs
-    tasks = []
-    for post in posts:
-        for url in post.get("image_urls", []):
-            tasks.append((post["uri"], url, post.get("text", "")[:100]))
-            if len(tasks) >= max_images:
-                break
-        if len(tasks) >= max_images:
-            break
-
-    if not tasks:
-        return []
-
-    print(f"  🖼️  Captioning {len(tasks)} images …")
 
     results = []
+    vision_tasks = []
 
-    def _caption_one(post_uri: str, image_url: str, context: str) -> dict | None:
-        """Caption a single image using vision model."""
-        for model in VISION_MODELS:
-            try:
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {
+    # Pass 1: Harvest alt text (free, instant)
+    for post in posts:
+        uri = post.get("uri", "")
+        for alt in post.get("image_alts", []):
+            if alt and len(alt) > 5:
+                results.append({
+                    "post_uri": uri,
+                    "caption": alt[:200],
+                    "source": "alt",
+                })
+                if len(results) >= max_images:
+                    break
+        if len(results) >= max_images:
+            break
+
+    # Pass 2: Queue images without alt text for vision model captioning
+    remaining = max_images - len(results)
+    if remaining > 0 and api_key:
+        for post in posts:
+            uri = post.get("uri", "")
+            alts = set(post.get("image_alts", []))
+            for url in post.get("image_urls", []):
+                if len(vision_tasks) >= remaining:
+                    break
+                vision_tasks.append((uri, url))
+            if len(vision_tasks) >= remaining:
+                break
+
+    n_alt = len(results)
+    if n_alt > 0:
+        print(f"  🖼️  {n_alt} images captioned via alt text (free)")
+
+    # Pass 2 execution: vision model captioning
+    if vision_tasks and api_key:
+        print(f"  🖼️  Captioning {len(vision_tasks)} images via vision model …")
+        client = openai.OpenAI(
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+        def _caption_one(post_uri: str, image_url: str) -> dict | None:
+            for model in VISION_MODELS:
+                try:
+                    resp = client.chat.completions.create(
+                        model=model,
+                        messages=[{
                             "role": "user",
                             "content": [
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        "Describe this image in one concise sentence. "
-                                        "Focus on the main subject, action, and setting. "
-                                        "Output ONLY the description, nothing else."
-                                    ),
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": image_url},
-                                },
+                                {"type": "text", "text": (
+                                    "Describe this image in one concise sentence. "
+                                    "Focus on the main subject, action, and setting. "
+                                    "Output ONLY the description, nothing else."
+                                )},
+                                {"type": "image_url", "image_url": {"url": image_url}},
                             ],
+                        }],
+                        max_tokens=100,
+                        temperature=0.3,
+                    )
+                    caption = resp.choices[0].message.content.strip()
+                    if caption and len(caption) > 5:
+                        return {
+                            "post_uri": post_uri,
+                            "image_url": image_url,
+                            "caption": caption[:200],
+                            "source": "vision",
+                            "model": model.split("/")[-1],
                         }
-                    ],
-                    max_tokens=100,
-                    temperature=0.3,
-                )
-                caption = resp.choices[0].message.content.strip()
-                if caption and len(caption) > 5:
-                    return {
-                        "post_uri": post_uri,
-                        "image_url": image_url,
-                        "caption": caption[:200],
-                        "model": model.split("/")[-1],
-                    }
-            except Exception:
-                continue
-        return None
+                except Exception:
+                    continue
+            return None
 
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {
-            pool.submit(_caption_one, uri, url, ctx): (uri, url)
-            for uri, url, ctx in tasks
-        }
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                results.append(result)
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {
+                pool.submit(_caption_one, uri, url): (uri, url)
+                for uri, url in vision_tasks
+            }
+            for future in as_completed(futures):
+                r = future.result()
+                if r:
+                    results.append(r)
 
-    n_ok = len(results)
-    print(f"  🖼️  Captioned {n_ok}/{len(tasks)} images")
+        n_vision = len(results) - n_alt
+        print(f"  🖼️  {n_vision}/{len(vision_tasks)} images captioned via vision model")
+
+    print(f"  🖼️  Total: {len(results)} image captions")
     return results
 
 
@@ -1591,7 +1628,7 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
     cluster_handle = cluster_posts.spawn(posts)
 
     # Caption images from posts (runs concurrently with clustering)
-    posts_with_images = [p for p in posts if p.get("image_urls")]
+    posts_with_images = [p for p in posts if p.get("image_urls") or p.get("image_alts")]
     captions_handle = None
     if posts_with_images:
         captions_handle = caption_images.spawn(posts_with_images, max_images=15)
