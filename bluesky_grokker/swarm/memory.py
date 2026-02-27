@@ -269,6 +269,10 @@ def find_nearest_memory_concept(concept: str, memory_concepts: Dict[str, Any],
 
 # ── Data types ───────────────────────────────────────────────────────────────
 
+# Cross-modal weight boost: concepts grounded in 2+ modalities are more robust
+CROSS_MODAL_BOOST = 0.5  # added per extra modality beyond the first
+
+
 @dataclass
 class ConceptNode:
     """A node in the braille concept graph."""
@@ -280,17 +284,20 @@ class ConceptNode:
     interaction_boosts: float = 0.0  # accumulated from likes/reposts
     nonsemantic: bool = False  # stop-concept: excluded from codebook/seeds/drift
     tier_hint: int = -1  # last codec tier index (0-4), -1 = unassigned; for hysteresis
+    modalities: Set[str] = field(default_factory=set)  # {"text", "image", "audio", ...}
 
     @property
     def effective_weight(self) -> float:
-        return self.weight + self.interaction_boosts
+        modal_boost = max(0, len(self.modalities) - 1) * CROSS_MODAL_BOOST
+        return self.weight + self.interaction_boosts + modal_boost
 
     @property
     def semantic_weight(self) -> float:
         """Weight for codebook/consensus purposes — zero if nonsemantic."""
         if self.nonsemantic:
             return 0.0
-        return self.weight + self.interaction_boosts
+        modal_boost = max(0, len(self.modalities) - 1) * CROSS_MODAL_BOOST
+        return self.weight + self.interaction_boosts + modal_boost
 
     def to_dict(self) -> dict:
         d = {
@@ -305,6 +312,8 @@ class ConceptNode:
             d["ns"] = True
         if self.tier_hint >= 0:
             d["th"] = self.tier_hint
+        if self.modalities:
+            d["mod"] = list(self.modalities)
         return d
 
     @classmethod
@@ -318,6 +327,7 @@ class ConceptNode:
             interaction_boosts=d.get("ib", 0.0),
             nonsemantic=d.get("ns", False),
             tier_hint=d.get("th", -1),
+            modalities=set(d.get("mod", [])),
         )
 
 
@@ -403,11 +413,13 @@ class BrailleMemory:
         relations: List[dict],
         provider: str = "unknown",
         n_posts: int = 0,
+        modality: str = "text",
     ) -> dict:
         """Feed one model's extraction into memory.
 
         concepts_by_category: {"topics": [...], "entities": [...], ...}
         relations: [{"src": ..., "type": ..., "tgt": ...}, ...]
+        modality: source modality ("text", "image", "audio", etc.)
         """
         now = time.time()
         n_concepts = 0
@@ -450,6 +462,7 @@ class BrailleMemory:
                 node.providers.add(provider)
                 node.last_seen = now
                 node.categories.add(category)
+                node.modalities.add(modality)
                 if _is_nonsem:
                     node.nonsemantic = True
                 n_concepts += 1

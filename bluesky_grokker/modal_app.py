@@ -125,14 +125,37 @@ def capture_firehose(seconds: int = 30) -> dict:
 
                 is_reply = bool(raw.get("reply"))
 
+                # Extract image blob URLs if present
+                image_urls = []
+                embed = raw.get("embed", {})
+                embed_type = embed.get("$type", "") if isinstance(embed, dict) else ""
+                images_list = []
+                if embed_type == "app.bsky.embed.images":
+                    images_list = embed.get("images", [])
+                elif embed_type == "app.bsky.embed.recordWithMedia":
+                    media = embed.get("media", {})
+                    if media.get("$type") == "app.bsky.embed.images":
+                        images_list = media.get("images", [])
+                for img in images_list[:2]:  # max 2 images per post
+                    blob = img.get("image", {})
+                    ref = blob.get("ref", {})
+                    cid = ref.get("$link", "") if isinstance(ref, dict) else ""
+                    if cid:
+                        url = (f"https://cdn.bsky.app/img/feed_thumbnail/plain/"
+                               f"{commit.repo}/{cid}@jpeg")
+                        image_urls.append(url)
+
                 with lock:
-                    posts.append({
+                    post_data = {
                         "uri": f"at://{commit.repo}/{op.path}",
                         "author_did": commit.repo,
                         "text": text[:500],
                         "created_at": created_at,
                         "is_reply": is_reply,
-                    })
+                    }
+                    if image_urls:
+                        post_data["image_urls"] = image_urls
+                    posts.append(post_data)
                     if is_reply:
                         interactions.append({
                             "type": "reply",
@@ -167,11 +190,119 @@ def capture_firehose(seconds: int = 30) -> dict:
     except Exception:
         pass  # client.stop() causes a benign exception
 
-    print(f"📦 Captured {len(posts)} posts, {len(interactions)} interactions "
+    n_with_images = sum(1 for p in posts if p.get("image_urls"))
+    total_images = sum(len(p.get("image_urls", [])) for p in posts)
+    print(f"📦 Captured {len(posts)} posts ({n_with_images} with images, {total_images} total images), "
+          f"{len(interactions)} interactions "
           f"({sum(1 for i in interactions if i['type']=='like')} likes, "
           f"{sum(1 for i in interactions if i['type']=='repost')} reposts, "
           f"{sum(1 for i in interactions if i['type']=='reply')} replies)")
     return {"posts": posts, "interactions": interactions}
+
+
+# ── Image captioning (via free vision models on OpenRouter) ──────────────────
+
+# Vision-capable free models for image captioning
+VISION_MODELS = [
+    "meta-llama/llama-3.2-11b-vision-instruct:free",
+    "google/gemma-3-27b-it:free",  # fallback (supports image URLs)
+]
+
+
+@app.function(timeout=120)
+def caption_images(posts: list[dict], max_images: int = 15) -> list[dict]:
+    """Caption images from Bluesky posts using free vision models.
+
+    Takes posts with image_urls, returns a list of
+    {"post_uri": ..., "image_url": ..., "caption": ..., "model": ...}
+
+    Cost: $0.00 (free-tier OpenRouter vision models).
+    Budget: max_images per run to bound latency (~2s each).
+    """
+    import os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    import openai
+
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        return []
+
+    client = openai.OpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    # Collect (post_uri, image_url) pairs
+    tasks = []
+    for post in posts:
+        for url in post.get("image_urls", []):
+            tasks.append((post["uri"], url, post.get("text", "")[:100]))
+            if len(tasks) >= max_images:
+                break
+        if len(tasks) >= max_images:
+            break
+
+    if not tasks:
+        return []
+
+    print(f"  🖼️  Captioning {len(tasks)} images …")
+
+    results = []
+
+    def _caption_one(post_uri: str, image_url: str, context: str) -> dict | None:
+        """Caption a single image using vision model."""
+        for model in VISION_MODELS:
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Describe this image in one concise sentence. "
+                                        "Focus on the main subject, action, and setting. "
+                                        "Output ONLY the description, nothing else."
+                                    ),
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": image_url},
+                                },
+                            ],
+                        }
+                    ],
+                    max_tokens=100,
+                    temperature=0.3,
+                )
+                caption = resp.choices[0].message.content.strip()
+                if caption and len(caption) > 5:
+                    return {
+                        "post_uri": post_uri,
+                        "image_url": image_url,
+                        "caption": caption[:200],
+                        "model": model.split("/")[-1],
+                    }
+            except Exception:
+                continue
+        return None
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {
+            pool.submit(_caption_one, uri, url, ctx): (uri, url)
+            for uri, url, ctx in tasks
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                results.append(result)
+
+    n_ok = len(results)
+    print(f"  🖼️  Captioned {n_ok}/{len(tasks)} images")
+    return results
 
 
 # ── Semantic clustering (lightweight, no DB needed) ──────────────────────────
@@ -661,10 +792,12 @@ def swarm_distill(
     clusters: list[dict],
     window_seconds: int = 30,
     memory_state: str = "",
+    image_captions: list[dict] | None = None,
 ) -> dict:
     """Braille-swarm-consensus pipeline with persistent BrailleMemory.
 
     Phase 1 — Fan out to N models: each extracts structured concept tokens
+    Phase 1b— Extract concepts from image captions (multimodal grounding)
     Phase 2 — Encode all concepts into Z₂⁸ braille vector space
     Phase 2b— Feed extractions into BrailleMemory (the living weight model)
     Phase 3 — Merge/distill in braille-encoded space (multi-provider boosting)
@@ -884,6 +1017,52 @@ def swarm_distill(
         })
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PHASE 1b: Multimodal — extract concepts from image captions
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    n_image_concepts = 0
+    if image_captions:
+        print(f"\n  🖼️  PHASE 1b: Extracting concepts from {len(image_captions)} image captions …")
+
+        # Build a mini-document from all captions for batch extraction
+        caption_text = "\n".join(
+            f"- Image: {cap['caption']}" for cap in image_captions
+        )
+
+        # Use the primary model to extract structured concepts from captions
+        try:
+            img_resp = client.chat.completions.create(
+                model=SWARM_MODELS[0],  # most reliable model
+                messages=[
+                    {"role": "system", "content": extraction_system},
+                    {"role": "user", "content": (
+                        f"Analyze these image descriptions from Bluesky posts "
+                        f"({len(image_captions)} images):\n{caption_text}"
+                    )},
+                ],
+                max_tokens=800,
+                temperature=0.4,
+            )
+            img_raw = (img_resp.choices[0].message.content or "").strip()
+            img_parsed = _extract_json(img_raw)
+            if img_parsed:
+                n_image_concepts = sum(
+                    len(img_parsed.get(k, []))
+                    for k in ("topics", "entities", "sentiments", "actions")
+                )
+                model_extractions.append({
+                    "model": "vision/image-captions",
+                    "data": img_parsed,
+                    "raw": img_raw,
+                    "_modality": "image",  # tag for Phase 2b ingestion
+                })
+                print(f"    ✓ Image extraction: {n_image_concepts} concepts from {len(image_captions)} images")
+            else:
+                print(f"    ✗ Image extraction: json_parse failed")
+        except Exception as e:
+            print(f"    ✗ Image extraction failed: {e}")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PHASE 2: Z₂⁸ Tiered Variable-Width Encoding + Sparse Relation Tuples
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1024,9 +1203,11 @@ def swarm_distill(
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     print("\n  🧠 PHASE 2b: Feeding extractions into BrailleMemory …")
+    n_cross_modal = 0
     for ext in model_extractions:
         d = ext["data"]
         provider = ext["model"].split("/")[-1]
+        modality = ext.get("_modality", "text")
         concepts_by_cat = {}
         for key in ("topics", "entities", "sentiments", "actions"):
             concepts_by_cat[key] = d.get(key, [])
@@ -1035,9 +1216,15 @@ def swarm_distill(
             relations=d.get("relations", []),
             provider=provider,
             n_posts=total_posts,
+            modality=modality,
         )
+    # Count cross-modal concepts (grounded in 2+ modalities)
+    for node in memory.concepts.values():
+        if len(node.modalities) >= 2:
+            n_cross_modal += 1
+    modal_str = f", {n_cross_modal} cross-modal" if n_cross_modal else ""
     print(f"  🧠 Memory now: {len(memory.concepts)} concepts, "
-          f"{len(memory.relations)} relations")
+          f"{len(memory.relations)} relations{modal_str}")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PHASE 3: Braille-space consensus — decode, merge, boost multi-provider
@@ -1400,13 +1587,29 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
 
     print(f"\n📊 Stage 1 complete: {len(posts)} posts, {len(interactions)} interactions\n")
 
-    # Stage 2: Cluster
-    clusters = cluster_posts.remote(posts)
+    # Stage 2: Cluster + Caption images (in parallel)
+    cluster_handle = cluster_posts.spawn(posts)
+
+    # Caption images from posts (runs concurrently with clustering)
+    posts_with_images = [p for p in posts if p.get("image_urls")]
+    captions_handle = None
+    if posts_with_images:
+        captions_handle = caption_images.spawn(posts_with_images, max_images=15)
+
+    clusters = cluster_handle.get()
     if not clusters:
         print("❌ No clusters formed")
         return {"error": "No clusters formed", "post_count": len(posts)}
 
-    print(f"📊 Stage 2 complete: {len(clusters)} clusters formed")
+    image_caps = []
+    if captions_handle is not None:
+        try:
+            image_caps = captions_handle.get()
+        except Exception as e:
+            print(f"  ⚠️ Image captioning failed: {e}")
+
+    print(f"📊 Stage 2 complete: {len(clusters)} clusters formed"
+          f"{f', {len(image_caps)} images captioned' if image_caps else ''}")
     for c in clusters:
         print(f"    • {c['topic']} ({c['post_count']} posts)")
     print()
@@ -1416,6 +1619,7 @@ def run_pipeline(seconds: int = 30, dry_run: bool = False) -> dict:
         clusters,
         window_seconds=seconds,
         memory_state=memory_state,
+        image_captions=image_caps if image_caps else None,
     )
     observation = distill_result["text"]
     models_used = distill_result["models"]
